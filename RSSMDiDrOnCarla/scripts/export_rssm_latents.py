@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore", ".*truncated to dtype int32.*")
 jax = None
 jnp = None
 embodied = None
-car_dreamer = Non
+car_dreamer = None
 dreamerv3 = None
 nj = None
 wrap_env = None
