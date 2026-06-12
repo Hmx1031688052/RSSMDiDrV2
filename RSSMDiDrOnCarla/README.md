@@ -297,9 +297,9 @@ python -m RSSMDiDrOnCarla.scripts.eval_open_loop_rssm_didr \
 python -m RSSMDiDrOnCarla.scripts.eval_open_loop_rssm_didr \
   --replay_dir "$REPLAY_DIR" \
   --latent_dir "$LATENT_DIR" \
-  --planner_checkpoint "$PLANNER_CKPT_DIR/best.pt" \
+  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/rssm_didr_roundabout/selector_ranking_finetune/best.pt" \
   --anchor_path "$ANCHOR_PATH" \
-  --output_dir "$RUN_ROOT/open_loop_eval_cached" \
+  --output_dir "$RUN_ROOT/selector_open_loop_eval_cached" \
   --waypoint_scale 30.0 \
   --eval_noise clean \
   --device auto \
@@ -315,7 +315,7 @@ python -m RSSMDiDrOnCarla.scripts.eval_open_loop_rssm_didr \
 python -m RSSMDiDrOnCarla.scripts.eval_close_loop_rssm_didr \
   --task carla_roundabout \
   --rssm_checkpoint "$RUN_ROOT/offline_rssm/checkpoint.ckpt" \
-  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDIDR/outputs/rssm_didr_roundabout/planner_checkpoints_0.03std/epoch_0106.pt" \
+  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/rssm_didr_roundabout/selector_ranking_finetune/best.pt" \
   --anchor_path "$ANCHOR_PATH" \
   --output_dir "$RUN_ROOT/closed_loop_eval_rssm" \
   --episodes 10 \
@@ -346,9 +346,9 @@ python -m RSSMDiDrOnCarla.scripts.eval_close_loop_rssm_didr \
 python -m RSSMDiDrOnCarla.scripts.export_torch_selector_ranking_dataset_with_jax_rssm \
   --offline_replay_dir "$REPLAY_DIR" \
   --rssm_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDIDR/outputs/rssm_didr_roundabout/offline_rssm/checkpoint.ckpt" \
-  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDIDR/outputs/rssm_didr_roundabout/planner_checkpoints_0.03std/epoch_0100.pt" \
+  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDIDR/outputs/rssm_didr_roundabout/planner_checkpoints_0.03std/epoch_0200.pt" \
   --anchor_path "$ANCHOR_PATH" \
-  --output_dir "$RUN_ROOT/selector_ranking_dataset" \
+  --output_dir "$RUN_ROOT/selector_ranking_dataset_0200pt" \
   --batch_length 64 \
   --batch_size 16 \
   --sequence_stride 1 \
