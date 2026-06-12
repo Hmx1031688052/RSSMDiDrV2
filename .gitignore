@@ -1,0 +1,56 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Conda / venv
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+logs/
+log/
+runs/
+wandb/
+tensorboard/
+*.log
+
+# Checkpoints / models
+checkpoints/
+ckpt/
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.safetensors
+
+# Datasets
+dataset/
+datasets/
+data/
+carla_dataset/
+planner_dataset/
+jax_planner_dataset/
+
+# Outputs
+outputs/
+results/
+experiments/
+debug/
+tmp/
+temp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+# External reference code, not pushed to this repo
+DiffusionDriveV2/
