@@ -33,7 +33,7 @@ ckpt/
 # Datasets
 dataset/
 datasets/
-data/
+# data/
 carla_dataset/
 planner_dataset/
 jax_planner_dataset/
