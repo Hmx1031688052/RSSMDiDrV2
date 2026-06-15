@@ -362,10 +362,10 @@ python -m RSSMDiDrOnCarla.scripts.export_torch_selector_ranking_dataset_with_jax
 
 python -m RSSMDiDrOnCarla.scripts.train_torch_selector_from_ranking_dataset \
   --dataset_dir "$RUN_ROOT/selector_ranking_dataset" \
-  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDIDR/outputs/rssm_didr_roundabout/planner_checkpoints_0.03std/epoch_0100.pt" \
+  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDIDR/outputs/rssm_didr_roundabout/planner_checkpoints_0.03std/epoch_0200.pt" \
   --anchor_path "$ANCHOR_PATH" \
   --output_dir "$RUN_ROOT/selector_ranking_finetune" \
-  --iterations 200000 \
+  --iterations 2000000 \
   --batch_size 1024 \
   --lr 1e-5 \
   --ranking_weight 1.0 \

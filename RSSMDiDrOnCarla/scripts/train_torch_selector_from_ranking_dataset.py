@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adv_eps", type=float, default=1e-4)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument("--save_every", type=int, default=100000)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=500)
     parser.add_argument("--eval_batches", type=int, default=20)
