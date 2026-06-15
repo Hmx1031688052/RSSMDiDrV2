@@ -17,9 +17,11 @@ averaging; each mode is controlled and imagined separately.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import datetime as _datetime
 import json
 import math
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -27,6 +29,14 @@ from typing import Dict, Iterable, Optional
 
 import numpy as np
 
+
+def configure_native_logs(argv: list[str]) -> None:
+    if "--show_xla_warnings" in argv:
+        return
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+
+configure_native_logs(sys.argv[1:])
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -123,6 +133,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--save_every_outer", type=int, default=1)
     parser.add_argument("--no_collect", action="store_true")
+    parser.add_argument(
+        "--show_xla_warnings",
+        action="store_true",
+        help="Show native XLA/cuDNN autotune logs. Hidden by default to keep training logs readable.",
+    )
     return parser.parse_known_args()
 
 
@@ -239,22 +254,34 @@ def scalarize(metrics: Dict[str, object]) -> Dict[str, float]:
 
 
 def deep_copy_to_device(tree, device):
-    host = jax.device_get(tree)
-    return jax.tree_util.tree_map(lambda x: jax.device_put(np.array(x), device), host)
+    with transfer_guard_allow():
+        host = jax.device_get(tree)
+        return jax.tree_util.tree_map(lambda x: jax.device_put(np.array(x), device), host)
 
 
 def allow_jax_transfers() -> None:
     """Dreamer sets transfer_guard=disallow; this script explicitly feeds numpy replay/checkpoints."""
-    for option in ("jax_transfer_guard", "jax_transfer_guard_host_to_device"):
+    for option in (
+        "jax_transfer_guard",
+        "jax_transfer_guard_host_to_device",
+        "jax_transfer_guard_device_to_host",
+        "jax_transfer_guard_device_to_device",
+    ):
         try:
             jax.config.update(option, "allow")
         except Exception:
             pass
 
 
+def transfer_guard_allow():
+    guard = getattr(jax, "transfer_guard", None)
+    return guard("allow") if guard is not None else nullcontext()
+
+
 def to_device_tree(tree, device):
-    host = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), tree)
-    return jax.tree_util.tree_map(lambda x: jax.device_put(x, device), host)
+    with transfer_guard_allow():
+        host = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), tree)
+        return jax.tree_util.tree_map(lambda x: jax.device_put(x, device), host)
 
 
 def replace_selector_params(params, selector_params):
@@ -465,9 +492,10 @@ class StableOnlineTrainer:
             optax.clip_by_global_norm(float(args.grad_clip)),
             optax.adamw(float(args.selector_lr), weight_decay=float(args.selector_weight_decay)),
         )
-        self.selector_state = self.selector_opt.init(self.selector_params)
+        with transfer_guard_allow():
+            self.selector_state = self.selector_opt.init(self.selector_params)
+            self.target_varibs = deep_copy_to_device(self.agent.varibs, self.device)
         self.wm_train_state = None
-        self.target_varibs = deep_copy_to_device(self.agent.varibs, self.device)
 
         self._wm_train_fn = self._make_wm_train_fn()
         self._rssm_init_fn = self._make_rssm_init_fn()
