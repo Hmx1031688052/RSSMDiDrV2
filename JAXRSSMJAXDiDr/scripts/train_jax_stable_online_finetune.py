@@ -17,7 +17,7 @@ averaging; each mode is controlled and imagined separately.
 from __future__ import annotations
 
 import argparse
-import copy
+from contextlib import nullcontext
 import datetime as _datetime
 import json
 import math
@@ -240,8 +240,40 @@ def scalarize(metrics: Dict[str, object]) -> Dict[str, float]:
 
 
 def deep_copy_to_device(tree, device):
-    host = jax.device_get(tree)
-    return jax.tree_util.tree_map(lambda x: jax.device_put(np.array(x), device), host)
+    with transfer_guard_allow():
+        host = jax.device_get(tree)
+        return jax.tree_util.tree_map(lambda x: jax.device_put(np.array(x), device), host)
+
+
+def allow_jax_transfers() -> None:
+    """Dreamer sets transfer_guard=disallow; this script explicitly feeds numpy replay/checkpoints."""
+    for option in (
+        "jax_transfer_guard",
+        "jax_transfer_guard_host_to_device",
+        "jax_transfer_guard_device_to_host",
+        "jax_transfer_guard_device_to_device",
+    ):
+        try:
+            jax.config.update(option, "allow")
+        except Exception:
+            pass
+
+
+def transfer_guard_allow():
+    guard = getattr(jax, "transfer_guard", None)
+    return guard("allow") if guard is not None else nullcontext()
+
+
+def to_device_tree(tree, device):
+    with transfer_guard_allow():
+        host = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), tree)
+        return jax.tree_util.tree_map(lambda x: jax.device_put(x, device), host)
+
+
+def replace_selector_params(params, selector_params):
+    params = dict(params)
+    params["selector_head"] = selector_params
+    return params
 
 
 def flatten_state_feat(state):
@@ -261,16 +293,6 @@ def poses_xy_meters(poses_reg, args: argparse.Namespace):
     if args.planner_output_unit == "normalized":
         xy = xy * float(args.waypoint_scale)
     return xy
-
-
-def selector_only_updates(updates):
-    out = {}
-    for key, value in updates.items():
-        if key == "selector_head":
-            out[key] = value
-        else:
-            out[key] = jax.tree_util.tree_map(jnp.zeros_like, value)
-    return out
 
 
 def override_anchor(config, params, anchor_path: Optional[str]):
@@ -407,6 +429,7 @@ class StableOnlineTrainer:
 
         self.step = offline_rssm.embodied.Counter()
         self.agent = offline_rssm.dreamerv3.Agent(self.obs_space, self.act_space, self.step, self.config.dreamerv3)
+        allow_jax_transfers()
         if len(self.agent.train_devices) != 1:
             raise ValueError("Set dreamerv3.jax.train_devices=[0].")
         self.device = self.agent.train_devices[0]
@@ -444,17 +467,21 @@ class StableOnlineTrainer:
         self.planner_config.ctrl_acc_min = float(args.env_acc_min)
         self.planner_config.ctrl_acc_max = float(args.env_acc_max)
         self.planner_config.ctrl_target_speed_max = float(args.target_speed_max)
-        self.planner_params = jax.tree_util.tree_map(jnp.asarray, planner_params)
-        self.ref_planner_params = copy.deepcopy(self.planner_params)
+        self.planner_params = to_device_tree(planner_params, self.device)
+        if "selector_head" not in self.planner_params:
+            raise KeyError("Planner checkpoint does not contain params['selector_head'].")
+        self.selector_params = self.planner_params["selector_head"]
+        self.ref_planner_params = jax.tree_util.tree_map(jax.lax.stop_gradient, self.planner_params)
         self.planner_epoch = int(planner_epoch)
 
         self.selector_opt = optax.chain(
             optax.clip_by_global_norm(float(args.grad_clip)),
             optax.adamw(float(args.selector_lr), weight_decay=float(args.selector_weight_decay)),
         )
-        self.selector_state = self.selector_opt.init(self.planner_params)
+        with transfer_guard_allow():
+            self.selector_state = self.selector_opt.init(self.selector_params)
+            self.target_varibs = deep_copy_to_device(self.agent.varibs, self.device)
         self.wm_train_state = None
-        self.target_varibs = deep_copy_to_device(self.agent.varibs, self.device)
 
         self._wm_train_fn = self._make_wm_train_fn()
         self._rssm_init_fn = self._make_rssm_init_fn()
@@ -693,11 +720,12 @@ class StableOnlineTrainer:
         )
         return poses_reg[0], poses_cls[0]
 
-    def _selector_step_impl(self, params, opt_state, ref_params, feat, returns):
+    def _selector_step_impl(self, selector_params, opt_state, params, ref_params, feat, returns):
         args = self.args
 
-        def objective(p):
-            _, logits = planner_modes_logits(p, self.planner_config, feat, int(args.eval_timestep))
+        def objective(current_selector_params):
+            current_params = replace_selector_params(params, current_selector_params)
+            _, logits = planner_modes_logits(current_params, self.planner_config, feat, int(args.eval_timestep))
             _, ref_logits = planner_modes_logits(ref_params, self.planner_config, feat, int(args.eval_timestep))
             temperature = max(float(args.policy_temperature), 1e-6)
             logp = jax.nn.log_softmax(logits / temperature, axis=-1)
@@ -733,14 +761,12 @@ class StableOnlineTrainer:
             }
             return loss, metrics
 
-        (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
-        grads = selector_only_updates(grads)
-        updates, opt_state = self.selector_opt.update(grads, opt_state, params)
-        updates = selector_only_updates(updates)
-        params = optax.apply_updates(params, updates)
+        (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(selector_params)
+        updates, opt_state = self.selector_opt.update(grads, opt_state, selector_params)
+        selector_params = optax.apply_updates(selector_params, updates)
         metrics = dict(metrics)
         metrics["selector_loss"] = loss
-        return params, opt_state, metrics
+        return selector_params, opt_state, metrics
 
     def init_rssm_episode(self):
         rng = self.agent._next_rngs(self.agent.train_devices)
@@ -945,13 +971,15 @@ class StableOnlineTrainer:
             )
             modes_xy = jax.lax.stop_gradient(poses_xy_meters(poses_reg, self.args))
             returns = jax.lax.stop_gradient(self.returns_from_target(state, speed, modes_xy))
-            self.planner_params, self.selector_state, metrics = self._selector_step(
-                self.planner_params,
+            self.selector_params, self.selector_state, metrics = self._selector_step(
+                self.selector_params,
                 self.selector_state,
+                self.planner_params,
                 self.ref_planner_params,
                 feat,
                 returns,
             )
+            self.planner_params = replace_selector_params(self.planner_params, self.selector_params)
             metrics_last = scalarize(metrics)
             if update == 1 or update % int(self.args.log_every) == 0:
                 print(
