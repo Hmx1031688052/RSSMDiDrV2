@@ -128,6 +128,28 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--min_forward_x", type=float, default=0.2)
     parser.add_argument("--max_abs_y", type=float, default=20.0)
     parser.add_argument("--max_step_distance", type=float, default=12.0)
+    parser.add_argument(
+        "--ttc_penalty_weight",
+        type=float,
+        default=5.0,
+        help="Penalty scale subtracted from imagined reward when neighbor collision risk is high. Set 0 to disable.",
+    )
+    parser.add_argument("--ttc_threshold", type=float, default=3.0, help="TTC seconds below which imagined modes are penalized.")
+    parser.add_argument("--ttc_lateral_width", type=float, default=2.2, help="Half-width of ego-lane corridor for TTC scoring.")
+    parser.add_argument("--ttc_min_gap", type=float, default=2.0, help="Minimum longitudinal gap before TTC is considered zero.")
+    parser.add_argument("--ttc_max_distance", type=float, default=40.0, help="Ignore leading vehicles farther than this many meters.")
+    parser.add_argument(
+        "--ttc_cpa_distance",
+        type=float,
+        default=5.0,
+        help="CPA safety distance for side/rear/crossing vehicles in roundabout-style interactions.",
+    )
+    parser.add_argument(
+        "--ttc_cpa_time",
+        type=float,
+        default=3.0,
+        help="Lookahead seconds for closest-point-of-approach TTC scoring.",
+    )
 
     parser.add_argument("--jax_platform", default=None, choices=("cpu", "gpu", "tpu"))
     parser.add_argument("--log_every", type=int, default=10)
@@ -496,6 +518,11 @@ class StableOnlineTrainer:
             self.selector_state = self.selector_opt.init(self.selector_params)
             self.target_varibs = deep_copy_to_device(self.agent.varibs, self.device)
         self.wm_train_state = None
+        self.allowed_data_keys = set(self.obs_space.keys()) | {"action"}
+        if "neighbor_vehicles_local" in self.obs_space:
+            self.neighbor_vehicle_dim = int(self.obs_space["neighbor_vehicles_local"].shape[0])
+        else:
+            self.neighbor_vehicle_dim = 0
 
         self._wm_train_fn = self._make_wm_train_fn()
         self._rssm_init_fn = self._make_rssm_init_fn()
@@ -505,7 +532,6 @@ class StableOnlineTrainer:
         self._selector_step = jax.jit(self._selector_step_impl)
         self._plan_fn = jax.jit(self._plan_impl)
 
-        self.allowed_data_keys = set(self.obs_space.keys()) | {"action"}
         self.history: list[dict] = []
 
     def _make_wm_train_fn(self):
@@ -544,15 +570,20 @@ class StableOnlineTrainer:
                 speed = data["ego_speed"][:, -1].reshape((data["action"].shape[0], -1))[:, :1]
             else:
                 speed = jnp.zeros((data["action"].shape[0], 1), jnp.float32)
-            return state, speed, flatten_state_feat(state)
+            if "neighbor_vehicles_local" in data:
+                neighbors = data["neighbor_vehicles_local"][:, -1].reshape((data["action"].shape[0], -1))
+            else:
+                neighbors = jnp.zeros((data["action"].shape[0], int(self.neighbor_vehicle_dim)), jnp.float32)
+            return state, speed, flatten_state_feat(state), neighbors
 
         return offline_rssm.nj.jit(offline_rssm.nj.pure(start), device=self.device)
 
     def _make_returns_fn(self):
-        def mode_returns(state, speed, modes_xy):
+        def mode_returns(state, speed, neighbors, modes_xy):
             batch, modes = modes_xy.shape[:2]
             modes_xy = apply_plan_sign(modes_xy, self.args.plan_x_sign, self.args.plan_y_sign)
             flat_modes = modes_xy.reshape((batch * modes, modes_xy.shape[-2], 2))
+            flat_neighbors = jnp.repeat(neighbors[:, None], modes, axis=1).reshape((batch * modes, -1))
             cur_state = jax.tree_util.tree_map(
                 lambda value: jnp.repeat(value[:, None], modes, axis=1).reshape(
                     (batch * modes,) + value.shape[1:]
@@ -580,6 +611,76 @@ class StableOnlineTrainer:
                 lx = cos_y * dx + sin_y * dy
                 ly = -sin_y * dx + cos_y * dy
                 return jnp.stack([lx, ly], axis=-1)
+
+            def ttc_penalty(neighbor_flat, x, y, yaw, ego_speed, elapsed):
+                if int(self.neighbor_vehicle_dim) <= 0 or float(self.args.ttc_penalty_weight) <= 0.0:
+                    return jnp.zeros_like(ego_speed)
+                neigh = neighbor_flat.reshape((neighbor_flat.shape[0], int(self.neighbor_vehicle_dim) // 11, 11))
+                valid = neigh[..., 0] > 0.5
+                nwx = neigh[..., 1] + neigh[..., 3] * elapsed
+                nwy = neigh[..., 2] + neigh[..., 4] * elapsed
+                dx = nwx - x[:, None]
+                dy = nwy - y[:, None]
+                cos_y = jnp.cos(yaw)[:, None]
+                sin_y = jnp.sin(yaw)[:, None]
+
+                # Leading-vehicle TTC catches same-corridor following risk.
+                rel_x = cos_y * dx + sin_y * dy
+                rel_y = -sin_y * dx + cos_y * dy
+                rel_vx = cos_y * neigh[..., 3] + sin_y * neigh[..., 4]
+                closing = ego_speed[:, None] - rel_vx
+                gap = rel_x - float(self.args.ttc_min_gap)
+                in_corridor = (
+                    valid
+                    & (rel_x > 0.0)
+                    & (rel_x <= float(self.args.ttc_max_distance))
+                    & (jnp.abs(rel_y) <= float(self.args.ttc_lateral_width))
+                    & (closing > 1e-3)
+                )
+                ttc = gap / jnp.maximum(closing, 1e-3)
+                ttc = jnp.where(gap <= 0.0, 0.0, ttc)
+                normalized_risk = jnp.clip(
+                    (float(self.args.ttc_threshold) - ttc) / max(float(self.args.ttc_threshold), 1e-6),
+                    0.0,
+                    1.0,
+                )
+                leading_risk = jnp.where(in_corridor, jnp.square(normalized_risk), 0.0)
+
+                # CPA risk is lane-agnostic and catches roundabout merge/crossing
+                # cases from the side or rear under a short constant-velocity model.
+                ego_vx = ego_speed[:, None] * cos_y
+                ego_vy = ego_speed[:, None] * sin_y
+                rvx = neigh[..., 3] - ego_vx
+                rvy = neigh[..., 4] - ego_vy
+                rel_speed2 = jnp.square(rvx) + jnp.square(rvy)
+                dot = dx * rvx + dy * rvy
+                cpa_time = jnp.clip(
+                    -dot / jnp.maximum(rel_speed2, 1e-4),
+                    0.0,
+                    float(self.args.ttc_cpa_time),
+                )
+                cpa_dx = dx + rvx * cpa_time
+                cpa_dy = dy + rvy * cpa_time
+                cpa_dist = jnp.sqrt(jnp.square(cpa_dx) + jnp.square(cpa_dy) + 1e-6)
+                current_dist = jnp.sqrt(jnp.square(dx) + jnp.square(dy) + 1e-6)
+                cpa_distance = float(self.args.ttc_cpa_distance)
+                vehicle_radius = 0.5 * jnp.sqrt(jnp.square(neigh[..., 7]) + jnp.square(neigh[..., 8]))
+                safe_distance = jnp.maximum(cpa_distance, vehicle_radius + 1.5)
+                approaching = dot < 0.0
+                cpa_valid = (
+                    valid
+                    & (current_dist <= float(self.args.ttc_max_distance))
+                    & (rel_speed2 > 1e-4)
+                    & (approaching | (current_dist < safe_distance))
+                )
+                distance_risk = jnp.clip((safe_distance - cpa_dist) / jnp.maximum(safe_distance, 1e-6), 0.0, 1.0)
+                time_risk = jnp.clip(
+                    (float(self.args.ttc_cpa_time) - cpa_time) / max(float(self.args.ttc_cpa_time), 1e-6),
+                    0.0,
+                    1.0,
+                )
+                cpa_risk = jnp.where(cpa_valid, jnp.square(distance_risk) * time_risk, 0.0)
+                return jnp.maximum(jnp.max(leading_risk, axis=1), jnp.max(cpa_risk, axis=1))
 
             def eval_like_controller(rel_xy, ego_speed, last_steer, integral, prev_error, ready):
                 finite = jnp.all(jnp.isfinite(rel_xy), axis=(1, 2))
@@ -696,7 +797,7 @@ class StableOnlineTrainer:
                 action = jnp.stack([jnp.clip(acc_norm, -1.0, 1.0), steer], axis=-1)
                 return action, acc, steer, next_integral, next_prev_error, next_ready
 
-            for _ in range(int(self.args.score_horizon_steps)):
+            for step_idx in range(int(self.args.score_horizon_steps)):
                 rel_xy = to_current_ego(flat_modes, pose_x, pose_y, pose_yaw)
                 speed_vec = cur_speed.reshape((-1,))
                 action, acc, prev_steer, pid_integral, pid_prev_error, pid_ready = eval_like_controller(
@@ -710,6 +811,15 @@ class StableOnlineTrainer:
                 cur_state = self.agent.agent.wm.rssm.img_step(cur_state, action)
                 reward = self.agent.agent.wm.heads["reward"](cur_state).mode().reshape((-1,))
                 cont = self.agent.agent.wm.heads["cont"](cur_state).mean().reshape((-1,))
+                ttc_cost = ttc_penalty(
+                    flat_neighbors,
+                    pose_x,
+                    pose_y,
+                    pose_yaw,
+                    speed_vec,
+                    float(step_idx) * float(self.args.dt),
+                )
+                reward = reward - float(self.args.ttc_penalty_weight) * ttc_cost
                 returns = returns + discounts * reward
                 discounts = discounts * float(self.args.discount) * cont
 
@@ -962,12 +1072,12 @@ class StableOnlineTrainer:
     def start_from_target(self, batch):
         data = jax.tree_util.tree_map(lambda x: jax.device_put(x, self.device), batch)
         rng = self.agent._next_rngs(self.agent.train_devices)
-        (state, speed, feat), _ = self._start_fn(self.target_varibs, rng, data)
-        return state, speed, feat
+        (state, speed, feat, neighbors), _ = self._start_fn(self.target_varibs, rng, data)
+        return state, speed, feat, neighbors
 
-    def returns_from_target(self, state, speed, modes_xy):
+    def returns_from_target(self, state, speed, neighbors, modes_xy):
         rng = self.agent._next_rngs(self.agent.train_devices)
-        returns, _ = self._returns_fn(self.target_varibs, rng, state, speed, modes_xy)
+        returns, _ = self._returns_fn(self.target_varibs, rng, state, speed, neighbors, modes_xy)
         return returns
 
     def update_selector(self, outer_idx: int) -> dict:
@@ -976,7 +1086,7 @@ class StableOnlineTrainer:
         for update in range(1, int(self.args.selector_updates) + 1):
             batch = sampler.sample(int(self.args.batch_size), self.rng_np)
             batch = jax.tree_util.tree_map(lambda x: jax.device_put(x, self.device), batch)
-            state, speed, feat = self.start_from_target(batch)
+            state, speed, feat, neighbors = self.start_from_target(batch)
             poses_reg, _ = planner_modes_logits(
                 self.planner_params,
                 self.planner_config,
@@ -984,7 +1094,7 @@ class StableOnlineTrainer:
                 int(self.args.eval_timestep),
             )
             modes_xy = jax.lax.stop_gradient(poses_xy_meters(poses_reg, self.args))
-            returns = jax.lax.stop_gradient(self.returns_from_target(state, speed, modes_xy))
+            returns = jax.lax.stop_gradient(self.returns_from_target(state, speed, neighbors, modes_xy))
             self.selector_params, self.selector_state, metrics = self._selector_step(
                 self.selector_params,
                 self.selector_state,
