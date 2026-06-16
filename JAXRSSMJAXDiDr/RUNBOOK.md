@@ -401,7 +401,57 @@ action == executed_control
 
 Do not store waypoint as `action`.
 
-## 9. Smoke Tests
+## 9. VAD Six-Camera Perception Latents
+
+All VAD/CARLA helper programs for the JAX-only path live under
+`JAXRSSMJAXDiDr/`.
+
+Collect replay with VAD-style six RGB cameras:
+
+```bash
+python -m JAXRSSMJAXDiDr.scripts.collect_vad_sixcam_replay \
+  --task carla_roundabout \
+  --dreamerv3.logdir "$RUN_ROOT/vad_sixcam_collect" \
+  --env.expert_collection.episodes 1000 \
+  --env.planner_target.use_waypoint_action False
+```
+
+The camera keys are written in VAD/nuScenes order:
+
+```text
+camera_front
+camera_front_right
+camera_front_left
+camera_back
+camera_back_left
+camera_back_right
+```
+
+Export compact VAD scene latents from collected replay:
+
+```bash
+python -m JAXRSSMJAXDiDr.scripts.export_vad_latents \
+  --replay_dir "$RUN_ROOT/vad_sixcam_collect/replay" \
+  --output_dir "$RUN_ROOT/vad_latent_replay" \
+  --vad_root ./VAD \
+  --vad_model tiny \
+  --vad_checkpoint ./VAD/ckpts/VAD_tiny_stage_2.pth
+```
+
+This writes `vad_scene_latent` to each replay chunk. By default it concatenates
+pooled VAD BEV features, updated agent query tokens, updated map query tokens,
+and the ego query. Use `--latent_components bev` if you want the earlier
+BEV-only latent. Use `vad_scene_latent` as an RSSM MLP observation key rather
+than feeding VAD's final ego trajectory into RSSM.
+
+Recommended starting point:
+
+```text
+VAD-Tiny first: 100x100 BEV, 3 encoder layers, queue_length=3, about 16.8 FPS in the VAD README.
+VAD-Base later: 200x200 BEV, 6 encoder layers, queue_length=4, better open-loop metrics but about 4.5 FPS.
+```
+
+## 10. Smoke Tests
 
 Compile:
 
@@ -443,7 +493,7 @@ print("JAXRSSMJAXDiDr smoke OK")
 PY
 ```
 
-## 10. Output Summary
+## 11. Output Summary
 
 Main reusable artifacts:
 
