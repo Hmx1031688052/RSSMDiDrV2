@@ -11,7 +11,7 @@ DiffusionDrive side to JAX:
   -> actor/critic updates
 
 The world model is intentionally not reimplemented here. Use the existing
-`RSSMDiDrOnCarla.scripts.train_offline_rssm` and Dreamer checkpoints for RSSM
+`JAXRSSMJAXDiDr.scripts.train_offline_rssm` and Dreamer checkpoints for RSSM
 training; this script fine-tunes the JAX planner and JAX critic against that
 RSSM.
 """
@@ -80,6 +80,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--plan_x_sign", type=float, default=1.0, choices=(-1.0, 1.0))
     parser.add_argument("--plan_y_sign", type=float, default=1.0, choices=(-1.0, 1.0))
     parser.add_argument("--jax_platform", default=None, choices=("cpu", "gpu", "tpu"))
+    parser.add_argument(
+        "--structured_world_model",
+        action="store_true",
+        help="Use the structured-only Dreamer RSSM config when loading the RSSM checkpoint.",
+    )
     parser.add_argument("--save_every", type=int, default=100)
     return parser.parse_known_args()
 
@@ -172,7 +177,7 @@ def control_smoothness(actions):
 
 class DreamerAdapter:
     def __init__(self, args: argparse.Namespace, extra: list[str], planner_config):
-        from RSSMDiDrOnCarla.scripts import train_offline_rssm as offline
+        from JAXRSSMJAXDiDr.scripts import train_offline_rssm as offline
 
         offline.import_runtime()
         rssm_args = argparse.Namespace(
@@ -184,8 +189,9 @@ class DreamerAdapter:
             replay_size=int(1e6),
             jax_platform=args.jax_platform,
             from_checkpoint="",
+            structured_world_model=bool(args.structured_world_model),
         )
-        config = offline.build_config(rssm_args, extra)
+        _, config = offline.build_config(rssm_args, extra)
         obs_space, act_space = offline.infer_spaces_from_replay(args.offline_replay_dir)
         step = offline.embodied.Counter()
         self.agent = offline.dreamerv3.Agent(obs_space, act_space, step, config.dreamerv3)

@@ -117,6 +117,52 @@ def get_spaces(raw_env, dreamerv3_config):
     return obs_space, act_space
 
 
+def make_space(array: np.ndarray, *, low=None, high=None):
+    array = np.asarray(array)
+    shape = tuple(array.shape[1:]) if array.ndim > 0 else ()
+    dtype = np.dtype(array.dtype).type
+    try:
+        return embodied.Space(dtype, shape, low=low, high=high)
+    except TypeError:
+        try:
+            return embodied.Space(dtype, shape)
+        except TypeError:
+            return embodied.Space(dtype=dtype, shape=shape, low=low, high=high)
+
+
+def infer_spaces_from_replay(replay_dir: str | Path):
+    """Infer Dreamer obs/action spaces from row-format replay chunks."""
+
+    paths = sorted(Path(replay_dir).glob("*.npz"))
+    if not paths:
+        raise FileNotFoundError(f"No replay chunks found in {replay_dir}")
+    for path in paths:
+        with np.load(path, allow_pickle=True) as data:
+            chunk = {key: np.asarray(data[key]) for key in data.files}
+        if "action" not in chunk:
+            continue
+        action = np.asarray(chunk["action"])
+        if action.ndim == 0:
+            continue
+        length = int(action.shape[0])
+        obs_space = {}
+        for key, value in chunk.items():
+            value = np.asarray(value)
+            if key == "action" or value.ndim == 0 or value.shape[0] != length:
+                continue
+            obs_space[key] = make_space(value)
+        obs_space.setdefault("reward", make_space(np.zeros((length,), dtype=np.float32)))
+        obs_space.setdefault("is_first", make_space(np.zeros((length,), dtype=bool)))
+        obs_space.setdefault("is_last", make_space(np.zeros((length,), dtype=bool)))
+        obs_space.setdefault("is_terminal", make_space(np.zeros((length,), dtype=bool)))
+        act_space = {
+            "action": make_space(action, low=-1.0, high=1.0),
+            "reset": make_space(np.zeros((length,), dtype=bool)),
+        }
+        return obs_space, act_space
+    raise KeyError(f"No replay chunk with temporal `action` found in {replay_dir}")
+
+
 def make_world_model_train(agent):
     def train_world_model(data, state):
         data = agent.agent.preprocess(data)

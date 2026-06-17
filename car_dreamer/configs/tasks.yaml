@@ -312,7 +312,7 @@ carla_roundabout:
     terminal:
       time_limit: 50000000000
     lane_start_point: [-52.6, 1.0, 0.1, 0.0]
-    route_csv: /home/pc/Hmx/Onsite_shanghai/ros2_carla/src/planning_wl/conf/RoadPoint.csv
+    route_csv: "RoadPoint (1).csv"
     planner_max_waypoints: 120
     planner_reach_threshold: 1.0
     # lane_start_point: [4.9, 40.0, 0.1, -90.0]
@@ -347,6 +347,10 @@ carla_roundabout:
       progress_clip: 2.0
       progress_waypoint_bonus: 0.15
       lateral_clip: 3.0
+      route_remaining_norm: 200.0
+      ttc_threshold: 3.0
+      ttc_safe_radius: 5.0
+      ttc_max_distance: 50.0
       scales:
         {
           waypoint: 2.0,
@@ -358,6 +362,7 @@ carla_roundabout:
           progress: 1.0,
           lateral: 0.8,
           heading: 0.3,
+          ttc: 8.0,
           acc_jerk: 0.03,
           steer_jerk: 0.03,
         }

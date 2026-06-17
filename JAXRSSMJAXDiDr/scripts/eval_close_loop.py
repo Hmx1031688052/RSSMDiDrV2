@@ -1,7 +1,7 @@
 """Closed-loop CARLA eval for the pure JAX RSSM-conditioned DiDr planner.
 
 This reuses the existing CARLA/RSSM/controller evaluation loop from
-`RSSMDiDrOnCarla.scripts.eval_close_loop_rssm_didr` and swaps only the planner
+`JAXRSSMJAXDiDr.scripts.eval_close_loop_rssm_didr` and swaps only the planner
 backend from PyTorch to the JAX checkpoint format.
 """
 
@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from JAXRSSMJAXDiDr.models import load_checkpoint, predict
-from RSSMDiDrOnCarla.scripts import eval_close_loop_rssm_didr as base
+from JAXRSSMJAXDiDr.scripts import eval_close_loop_rssm_didr as base
 
 
 EVAL_TIMESTEP = 0
