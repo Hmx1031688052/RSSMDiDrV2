@@ -27,7 +27,6 @@ warnings.filterwarnings("ignore", ".*truncated to dtype int32.*")
 jax = None
 jnp = None
 embodied = None
-car_dreamer = None
 dreamerv3 = None
 nj = None
 wrap_env = None
@@ -35,11 +34,10 @@ from_gym = None
 
 
 def import_runtime() -> None:
-    global jax, jnp, embodied, car_dreamer, dreamerv3, nj, wrap_env, from_gym
+    global jax, jnp, embodied, dreamerv3, nj, wrap_env, from_gym
     import jax as jax_module
     import jax.numpy as jnp_module
     import embodied as embodied_module
-    import car_dreamer as car_dreamer_module
     import dreamerv3 as dreamerv3_module
     from dreamerv3 import ninjax as ninjax_module
     from dreamerv3.collect_utils import wrap_env as wrap_env_fn
@@ -48,7 +46,6 @@ def import_runtime() -> None:
     jax = jax_module
     jnp = jnp_module
     embodied = embodied_module
-    car_dreamer = car_dreamer_module
     dreamerv3 = dreamerv3_module
     nj = ninjax_module
     wrap_env = wrap_env_fn
@@ -73,13 +70,25 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return parser.parse_known_args()
 
 
+def load_task_config(task: str, extra: list[str]):
+    config_dir = ROOT / "car_dreamer" / "configs"
+    yaml_loader = yaml.YAML(typ="safe")
+    common = yaml_loader.load((config_dir / "common.yaml").read_text())
+    tasks = yaml_loader.load((config_dir / "tasks.yaml").read_text())
+    if task not in tasks:
+        raise KeyError(f"Unknown task '{task}'. Available tasks: {sorted(tasks)}")
+    task_config = embodied.Config(common).update(tasks[task])
+    task_config, _ = embodied.Flags(task_config).parse_known(extra)
+    return task_config
+
+
 def build_config(args: argparse.Namespace, extra: list[str]):
     yaml_path = ROOT / "dreamerv3" / "dreamerv3.yaml"
     model_configs = yaml.YAML(typ="safe").load(embodied.Path(str(yaml_path)).read())
     config = embodied.Config({"dreamerv3": model_configs["defaults"]})
     config = config.update({"dreamerv3": model_configs["small"]})
 
-    raw_env, env_config = car_dreamer.create_task(args.task, extra)
+    env_config = load_task_config(args.task, extra)
     config = config.update(env_config)
     updates = {
         "dreamerv3.batch_length": args.batch_length,
@@ -103,7 +112,7 @@ def build_config(args: argparse.Namespace, extra: list[str]):
         updates["dreamerv3.jax.platform"] = args.jax_platform
     config = config.update(updates)
     config = embodied.Flags(config).parse(extra)
-    return raw_env, config
+    return config
 
 
 def get_spaces(raw_env, dreamerv3_config):
@@ -116,6 +125,50 @@ def get_spaces(raw_env, dreamerv3_config):
     except Exception:
         pass
     return obs_space, act_space
+
+
+def make_space(array: np.ndarray, *, low=None, high=None):
+    array = np.asarray(array)
+    shape = tuple(array.shape[1:]) if array.ndim > 0 else ()
+    dtype = np.dtype(array.dtype).type
+    try:
+        return embodied.Space(dtype, shape, low=low, high=high)
+    except TypeError:
+        try:
+            return embodied.Space(dtype, shape)
+        except TypeError:
+            return embodied.Space(dtype=dtype, shape=shape, low=low, high=high)
+
+
+def infer_spaces_from_replay(replay_dir: str | Path):
+    paths = sorted(Path(replay_dir).glob("*.npz"))
+    if not paths:
+        raise FileNotFoundError(f"No replay chunks found in {replay_dir}")
+    for path in paths:
+        with np.load(path, allow_pickle=True) as data:
+            chunk = {key: np.asarray(data[key]) for key in data.files}
+        if "action" not in chunk:
+            continue
+        action = np.asarray(chunk["action"])
+        if action.ndim == 0:
+            continue
+        length = int(action.shape[0])
+        obs_space = {}
+        for key, value in chunk.items():
+            value = np.asarray(value)
+            if key == "action" or value.ndim == 0 or value.shape[0] != length:
+                continue
+            obs_space[key] = make_space(value)
+        obs_space.setdefault("reward", make_space(np.zeros((length,), dtype=np.float32)))
+        obs_space.setdefault("is_first", make_space(np.zeros((length,), dtype=bool)))
+        obs_space.setdefault("is_last", make_space(np.zeros((length,), dtype=bool)))
+        obs_space.setdefault("is_terminal", make_space(np.zeros((length,), dtype=bool)))
+        act_space = {
+            "action": make_space(action, low=-1.0, high=1.0),
+            "reset": make_space(np.zeros((length,), dtype=bool)),
+        }
+        return obs_space, act_space
+    raise KeyError(f"No replay chunk with temporal `action` found in {replay_dir}")
 
 
 def make_export_fn(agent):
@@ -157,9 +210,9 @@ def flatten_latent(post: Dict[str, np.ndarray]) -> np.ndarray:
 def main() -> None:
     args, extra = parse_args()
     import_runtime()
-    raw_env, config = build_config(args, extra)
+    config = build_config(args, extra)
     cfg = config.dreamerv3
-    obs_space, act_space = get_spaces(raw_env, cfg)
+    obs_space, act_space = infer_spaces_from_replay(args.replay_dir)
     step = embodied.Counter()
 
     print("Task:", args.task)
