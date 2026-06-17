@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import gzip
 import pickle
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -37,11 +37,8 @@ class JAXDiDrConfig:
     decoder_heads: int = 4
     decoder_ffn_dim: int = 512
     dropout: float = 0.1
-    reg_loss_weight: float = 1.0
-    cls_loss_weight: float = 1.0
-    path_length_loss_weight: float = 0.05
-    step_length_loss_weight: float = 0.05
-    smooth_loss_weight: float = 0.01
+    reg_loss_weight: float = 8.0
+    cls_loss_weight: float = 10.0
     actor_softmax_temperature: float = 1.0
     waypoint_dt: float = 0.5
     wheelbase: float = 2.875
@@ -64,7 +61,8 @@ class JAXDiDrConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "JAXDiDrConfig":
-        return cls(**dict(data))
+        valid = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in dict(data).items() if key in valid})
 
 
 def _split(rng, count: int):
@@ -319,14 +317,17 @@ def predict(params: PyTree, config: JAXDiDrConfig, latent, timestep: int = 0, so
     return {"trajectory": traj, "poses_reg": poses_reg, "poses_cls": poses_cls, "timesteps": timesteps}
 
 
-def _cross_entropy(logits, labels):
-    logp = jax.nn.log_softmax(logits, axis=-1)
-    return -jnp.mean(logp[jnp.arange(labels.shape[0]), labels])
+def _binary_cross_entropy_with_logits(logits, target):
+    return jnp.maximum(logits, 0.0) - logits * target + jnp.log1p(jnp.exp(-jnp.abs(logits)))
 
 
-def _smooth_l1(value, beta: float = 1.0):
-    abs_value = jnp.abs(value)
-    return jnp.where(abs_value < beta, 0.5 * jnp.square(value) / beta, abs_value - 0.5 * beta)
+def _sigmoid_focal_loss(logits, target, gamma: float = 2.0, alpha: float = 0.25):
+    pred_sigmoid = jax.nn.sigmoid(logits)
+    target = target.astype(logits.dtype)
+    pt = (1.0 - pred_sigmoid) * target + pred_sigmoid * (1.0 - target)
+    focal_weight = (alpha * target + (1.0 - alpha) * (1.0 - target)) * jnp.power(pt, gamma)
+    loss = _binary_cross_entropy_with_logits(logits, target) * focal_weight
+    return loss.mean()
 
 
 def _regularize_latent(config: JAXDiDrConfig, rng, latent, training: bool):
@@ -352,33 +353,22 @@ def _planner_losses(params, config: JAXDiDrConfig, rng, latent, target, training
     mode_idx = jnp.argmin(anchor_dist, axis=-1)
     best_reg = poses_reg[jnp.arange(target.shape[0]), mode_idx]
 
-    reg_loss = jnp.mean(jnp.abs(best_reg - target))
-    cls_loss = _cross_entropy(poses_cls, mode_idx)
-    zero_pred = jnp.zeros_like(best_reg[:, :1, :2])
-    zero_target = jnp.zeros_like(target[:, :1, :2])
-    pred_steps = jnp.diff(jnp.concatenate([zero_pred, best_reg[..., :2]], axis=1), axis=1)
-    target_steps = jnp.diff(jnp.concatenate([zero_target, target[..., :2]], axis=1), axis=1)
-    pred_step = jnp.linalg.norm(pred_steps, axis=-1)
-    target_step = jnp.linalg.norm(target_steps, axis=-1)
-    path_loss = jnp.mean(_smooth_l1(pred_step.sum(axis=-1) - target_step.sum(axis=-1)))
-    step_loss = jnp.mean(_smooth_l1(pred_step - target_step))
-    smooth_loss = jnp.mean(jnp.linalg.norm(jnp.diff(best_reg[..., :2], n=2, axis=-2), axis=-1))
-    loss = (
-        float(config.reg_loss_weight) * reg_loss
-        + float(config.cls_loss_weight) * cls_loss
-        + float(config.path_length_loss_weight) * path_loss
-        + float(config.step_length_loss_weight) * step_loss
-        + float(config.smooth_loss_weight) * smooth_loss
-    )
+    target_onehot = jax.nn.one_hot(mode_idx, poses_cls.shape[-1], dtype=poses_cls.dtype)
+    cls_loss_raw = _sigmoid_focal_loss(poses_cls, target_onehot, gamma=2.0, alpha=0.25)
+    reg_loss_raw = jnp.mean(jnp.abs(best_reg - target))
+    cls_loss = float(config.cls_loss_weight) * cls_loss_raw
+    reg_loss = float(config.reg_loss_weight) * reg_loss_raw
+    loss = cls_loss + reg_loss
     ade = jnp.linalg.norm(best_reg[..., :2] - target[..., :2], axis=-1).mean()
     fde = jnp.linalg.norm(best_reg[..., -1, :2] - target[..., -1, :2], axis=-1).mean()
+    selected_idx = jnp.argmax(poses_cls, axis=-1)
     metrics = {
         "loss": loss,
         "reg_loss": reg_loss,
+        "reg_loss_raw": reg_loss_raw,
         "cls_loss": cls_loss,
-        "path_length_loss": path_loss,
-        "step_length_loss": step_loss,
-        "smooth_loss": smooth_loss,
+        "cls_loss_raw": cls_loss_raw,
+        "mode_cls_acc": (selected_idx == mode_idx).astype(jnp.float32).mean(),
         "ade": ade,
         "fde": fde,
     }

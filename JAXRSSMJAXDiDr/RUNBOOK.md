@@ -196,19 +196,19 @@ python -m JAXRSSMJAXDiDr.scripts.train_jax_planner_pretrain \
   --lr 1e-4 \
   --weight_decay 1e-4 \
   --dropout 0.1 \
+  --trajectory_cls_weight 10.0 \
+  --trajectory_reg_weight 8.0 \
   --latent_noise_std 0.03
 
 ```
 
-The supervised planner loss matches the TorchDiDr planner:
+The supervised planner loss follows `DiffusionDriveV2/modules/multimodal_loss.py`:
 
 ```text
-loss =
-  reg_loss
-  + cls_loss
-  + 0.05 * path_length_loss
-  + 0.05 * step_length_loss
-  + 0.01 * smooth_loss
+positive mode = argmin mean L2(target_xy, plan_anchor_xy)
+cls_loss = 10.0 * sigmoid_focal_loss(poses_cls, one_hot(positive mode), gamma=2, alpha=0.25)
+reg_loss = 8.0 * L1(poses_reg[positive mode], target_trajectory)
+loss = cls_loss + reg_loss
 ```
 
 Expected outputs:

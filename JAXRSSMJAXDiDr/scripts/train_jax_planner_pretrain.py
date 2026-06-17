@@ -44,6 +44,8 @@ def parse_args():
     parser.add_argument("--decoder_ffn_dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--waypoint_scale", type=float, default=30.0)
+    parser.add_argument("--trajectory_cls_weight", type=float, default=10.0)
+    parser.add_argument("--trajectory_reg_weight", type=float, default=8.0)
     parser.add_argument("--latent_noise_std", type=float, default=0.0)
     parser.add_argument("--latent_dropout", type=float, default=0.0)
     parser.add_argument("--save_every", type=int, default=1)
@@ -95,6 +97,8 @@ def main():
         decoder_ffn_dim=args.decoder_ffn_dim,
         dropout=args.dropout,
         waypoint_scale=args.waypoint_scale,
+        cls_loss_weight=args.trajectory_cls_weight,
+        reg_loss_weight=args.trajectory_reg_weight,
         latent_noise_std=args.latent_noise_std,
         latent_dropout=args.latent_dropout,
     )
