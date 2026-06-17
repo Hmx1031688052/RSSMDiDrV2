@@ -23,7 +23,6 @@ if str(ROOT / "dreamerv3") not in sys.path:
 warnings.filterwarnings("ignore", ".*truncated to dtype int32.*")
 
 embodied = None
-car_dreamer = None
 dreamerv3 = None
 nj = None
 wrap_env = None
@@ -31,16 +30,14 @@ from_gym = None
 
 
 def import_runtime() -> None:
-    global embodied, car_dreamer, dreamerv3, nj, wrap_env, from_gym
+    global embodied, dreamerv3, nj, wrap_env, from_gym
     import embodied as embodied_module
-    import car_dreamer as car_dreamer_module
     import dreamerv3 as dreamerv3_module
     from dreamerv3 import ninjax as ninjax_module
     from dreamerv3.collect_utils import wrap_env as wrap_env_fn
     from embodied.envs import from_gym as from_gym_module
 
     embodied = embodied_module
-    car_dreamer = car_dreamer_module
     dreamerv3 = dreamerv3_module
     nj = ninjax_module
     wrap_env = wrap_env_fn
@@ -68,13 +65,31 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return parser.parse_known_args()
 
 
-def build_config(args: argparse.Namespace, extra: list[str]):
+def load_task_config(task: str, extra: list[str]):
+    config_dir = ROOT / "car_dreamer" / "configs"
+    yaml_loader = yaml.YAML(typ="safe")
+    common = yaml_loader.load((config_dir / "common.yaml").read_text())
+    tasks = yaml_loader.load((config_dir / "tasks.yaml").read_text())
+    if task not in tasks:
+        raise KeyError(f"Unknown task '{task}'. Available tasks: {sorted(tasks)}")
+    task_config = embodied.Config(common).update(tasks[task])
+    task_config, _ = embodied.Flags(task_config).parse_known(extra)
+    return task_config
+
+
+def build_config(args: argparse.Namespace, extra: list[str], create_env: bool = False):
     yaml_path = ROOT / "dreamerv3" / "dreamerv3.yaml"
     model_configs = yaml.YAML(typ="safe").load(embodied.Path(str(yaml_path)).read())
     config = embodied.Config({"dreamerv3": model_configs["defaults"]})
     config = config.update({"dreamerv3": model_configs["small"]})
 
-    raw_env, env_config = car_dreamer.create_task(args.task, extra)
+    if create_env:
+        import car_dreamer
+
+        raw_env, env_config = car_dreamer.create_task(args.task, extra)
+    else:
+        raw_env = None
+        env_config = load_task_config(args.task, extra)
     config = config.update(env_config)
     updates = {
         "dreamerv3.logdir": args.logdir,
@@ -185,7 +200,7 @@ def scalarize(metrics: Dict[str, object]) -> Dict[str, float]:
 def main() -> None:
     args, extra = parse_args()
     import_runtime()
-    raw_env, config = build_config(args, extra)
+    _, config = build_config(args, extra, create_env=False)
     cfg = config.dreamerv3
     logdir = embodied.Path(cfg.logdir)
     logdir.mkdirs()
@@ -193,7 +208,7 @@ def main() -> None:
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     config.save(str(logdir / f"offline_rssm_config_{timestamp}.yaml"))
 
-    obs_space, act_space = get_spaces(raw_env, cfg)
+    obs_space, act_space = infer_spaces_from_replay(args.replay_dir)
     step = embodied.Counter()
     logger = embodied.Logger(
         step,

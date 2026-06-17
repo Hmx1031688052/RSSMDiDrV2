@@ -461,7 +461,7 @@ class StableOnlineTrainer:
             from_checkpoint="",
             structured_world_model=bool(args.structured_world_model),
         )
-        self.raw_env, self.config = offline_rssm.build_config(rssm_args, self.extra)
+        self.raw_env, self.config = offline_rssm.build_config(rssm_args, self.extra, create_env=True)
         env = offline_rssm.from_gym.FromGym(self.raw_env)
         self.env = offline_rssm.wrap_env(env, self.config.dreamerv3)
 
