@@ -110,7 +110,7 @@ def build_config(args: argparse.Namespace, extra: list[str], create_env: bool = 
                 "dreamerv3.decoder.cnn_keys": "none",
                 "dreamerv3.encoder.mlp_keys": structured_keys,
                 "dreamerv3.decoder.mlp_keys": structured_keys,
-                "dreamerv3.run.log_keys_video": [],
+                "dreamerv3.run.log_keys_video": ["none"],
             }
         )
     if args.jax_platform:
