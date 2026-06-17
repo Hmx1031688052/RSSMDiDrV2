@@ -60,7 +60,7 @@ defaults:
   data_loaders: 8
 
   # World Model
-  grad_heads: [decoder, reward, cont]
+  grad_heads: [decoder, reward, cont, collision]
   rssm:
     {
       deter: 4096,
@@ -141,12 +141,26 @@ defaults:
       winit: normal,
       fan: avg,
     }
+  collision_head:
+    {
+      layers: 5,
+      units: 1024,
+      act: silu,
+      norm: layer,
+      dist: binary,
+      outscale: 1.0,
+      outnorm: False,
+      inputs: [deter, stoch],
+      winit: normal,
+      fan: avg,
+    }
   loss_scales:
     {
       image: 1.0,
       vector: 1.0,
       reward: 1.0,
       cont: 1.0,
+      collision: 5.0,
       dyn: 0.5,
       rep: 0.1,
       actor: 1.0,

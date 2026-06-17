@@ -51,8 +51,8 @@ import optax
 from JAXRSSMJAXDiDr.models import load_checkpoint, save_checkpoint
 from JAXRSSMJAXDiDr.models.controller import apply_plan_sign
 from JAXRSSMJAXDiDr.models.jax_didr_planner import _decode, deterministic_anchors
-from RSSMDiDrOnCarla.scripts import eval_close_loop_rssm_didr as closed_loop
-from RSSMDiDrOnCarla.scripts import train_offline_rssm as offline_rssm
+from JAXRSSMJAXDiDr.scripts import eval_close_loop_rssm_didr as closed_loop
+from JAXRSSMJAXDiDr.scripts import train_offline_rssm as offline_rssm
 
 
 warnings.filterwarnings("ignore", ".*truncated to dtype int32.*")
@@ -80,6 +80,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--replay_size", type=float, default=1e6)
     parser.add_argument("--offline_ratio", type=float, default=0.7)
+    parser.add_argument(
+        "--structured_world_model",
+        action="store_true",
+        help="Use structured ego/neighbor/route observations only for the Dreamer world model.",
+    )
 
     parser.add_argument("--selector_lr", type=float, default=1e-5)
     parser.add_argument("--selector_weight_decay", type=float, default=1e-4)
@@ -233,6 +238,8 @@ class ReplaySequenceDataset:
         row.setdefault("is_last", np.zeros((self.batch_length,), dtype=bool))
         row.setdefault("is_terminal", np.zeros((self.batch_length,), dtype=bool))
         row.setdefault("reward", np.zeros((self.batch_length,), dtype=np.float32))
+        for key in ("destination_reached", "is_success", "out_of_lane", "time_exceeded", "is_collision"):
+            row.setdefault(key, np.zeros((self.batch_length,), dtype=bool))
         return row
 
 
@@ -452,6 +459,7 @@ class StableOnlineTrainer:
             replay_size=int(args.replay_size),
             jax_platform=args.jax_platform,
             from_checkpoint="",
+            structured_world_model=bool(args.structured_world_model),
         )
         self.raw_env, self.config = offline_rssm.build_config(rssm_args, self.extra)
         env = offline_rssm.from_gym.FromGym(self.raw_env)
@@ -518,7 +526,14 @@ class StableOnlineTrainer:
             self.selector_state = self.selector_opt.init(self.selector_params)
             self.target_varibs = deep_copy_to_device(self.agent.varibs, self.device)
         self.wm_train_state = None
-        self.allowed_data_keys = set(self.obs_space.keys()) | {"action"}
+        self.allowed_data_keys = set(self.obs_space.keys()) | {
+            "action",
+            "destination_reached",
+            "is_success",
+            "out_of_lane",
+            "time_exceeded",
+            "is_collision",
+        }
         if "neighbor_vehicles_local" in self.obs_space:
             self.neighbor_vehicle_dim = int(self.obs_space["neighbor_vehicles_local"].shape[0])
         else:
@@ -987,6 +1002,9 @@ class StableOnlineTrainer:
                 action = physical_to_normalized_action(acc, steer, self.args)
                 writer.append(obs, action, current_xy, cached_selected, cached_logits, cached_plan_age)
                 next_obs, info = self.env.step({"reset": False, "action": action})
+                for key in ("destination_reached", "is_success", "out_of_lane", "time_exceeded", "is_collision"):
+                    if key in info and key not in next_obs:
+                        next_obs[key] = np.asarray(info[key])
                 reward = float(np.asarray(next_obs.get("reward", 0.0)))
                 episode_return += reward
                 episode_steps += 1

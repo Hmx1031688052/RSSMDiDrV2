@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from .base_planner import BasePlanner
 
@@ -57,7 +58,12 @@ class CsvPathPlanner(BasePlanner):
         return yaw
 
     def init_route(self):
-        df = pd.read_csv(self._csv_path)
+        csv_path = Path(self._csv_path)
+        if not csv_path.is_absolute() and not csv_path.exists():
+            repo_candidate = Path(__file__).resolve().parents[3] / csv_path
+            if repo_candidate.exists():
+                csv_path = repo_candidate
+        df = pd.read_csv(csv_path)
 
         if self._x_col not in df.columns or self._y_col not in df.columns:
             raise ValueError(f"CSV must contain columns: {self._x_col}, {self._y_col}")
@@ -80,4 +86,3 @@ class CsvPathPlanner(BasePlanner):
 
     def extend_route(self):
         pass
-

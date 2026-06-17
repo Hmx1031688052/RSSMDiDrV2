@@ -98,29 +98,30 @@ class CarlaRoundaboutEnv(CarlaWptFixedEnv):
         r_heading = -float(scales.get("heading", 0.0)) * heading_error
 
         r_collision = -float(scales.get("collision", 0.0)) if self.is_collision() else 0.0
+        ttc, ttc_risk = self._quadratic_neighbor_ttc_risk(ego)
+        r_ttc = -float(scales.get("ttc", 0.0)) * ttc_risk
 
         acc_delta = float(abs(self._current_action[0] - self._last_action[0]))
         steer_delta = float(abs(self._current_action[1] - self._last_action[1]))
         r_acc_jerk = -float(scales.get("acc_jerk", 0.0)) * acc_delta
         r_steer_jerk = -float(scales.get("steer_jerk", 0.0)) * steer_delta
 
-        # total_reward += (
-        #     # r_progress
-        #     r_lateral
-        #     + r_heading
-        #     + r_collision
-        #     + r_acc_jerk
-        #     + r_steer_jerk
-        # )
+        # Base CarlaWptEnv.reward() already includes waypoint/speed efficiency,
+        # collision, out-of-lane, destination, and time terms. Roundabout adds
+        # only dense traffic-interaction safety here to avoid double counting.
+        total_reward += r_ttc
         info.update(
             {
                 "route_progress": route_progress,
                 "lateral_error": lateral_error,
                 "heading_error": heading_error,
+                "ttc": ttc,
+                "ttc_risk": ttc_risk,
                 "r_progress": r_progress,
                 "r_lateral": r_lateral,
                 "r_heading": r_heading,
                 "r_collision": r_collision,
+                "r_ttc": r_ttc,
                 "acc_delta": acc_delta,
                 "steer_delta": steer_delta,
                 "r_acc_jerk": r_acc_jerk,
@@ -129,6 +130,71 @@ class CarlaRoundaboutEnv(CarlaWptFixedEnv):
         )
         # print('info: ', info)
         return total_reward, info
+
+    def _quadratic_neighbor_ttc_risk(self, ego):
+        reward_cfg = self._config.reward
+        threshold = float(reward_cfg.get("ttc_threshold", 3.0))
+        safe_radius = float(reward_cfg.get("ttc_safe_radius", 5.0))
+        max_distance = float(reward_cfg.get("ttc_max_distance", 50.0))
+        threshold = max(threshold, 1e-6)
+        safe_radius = max(safe_radius, 1e-6)
+
+        try:
+            neighbors = self._get_neighbor_vehicles_local().reshape(-1, 11)
+        except Exception:
+            return 0.0, 0.0
+        valid = neighbors[:, 0] > 0.5
+        if not np.any(valid):
+            return 0.0, 0.0
+
+        ego_tf = ego.get_transform()
+        ego_yaw = math.radians(float(ego_tf.rotation.yaw))
+        ego_vel = ego.get_velocity()
+        ego_vx = math.cos(ego_yaw) * float(ego_vel.x) + math.sin(ego_yaw) * float(ego_vel.y)
+        ego_vy = -math.sin(ego_yaw) * float(ego_vel.x) + math.cos(ego_yaw) * float(ego_vel.y)
+
+        min_ttc = float("inf")
+        max_risk = 0.0
+        for veh in neighbors[valid]:
+            px = float(veh[1])
+            py = float(veh[2])
+            current_dist = math.sqrt(px * px + py * py)
+            if current_dist > max_distance:
+                continue
+
+            vehicle_radius = 0.5 * math.sqrt(float(veh[7]) ** 2 + float(veh[8]) ** 2)
+            radius = max(safe_radius, vehicle_radius + 1.5)
+            if current_dist <= radius:
+                min_ttc = 0.0
+                max_risk = 1.0
+                continue
+
+            vx = float(veh[3]) - ego_vx
+            vy = float(veh[4]) - ego_vy
+            a = vx * vx + vy * vy
+            b = 2.0 * (px * vx + py * vy)
+            c = px * px + py * py - radius * radius
+            if a <= 1e-8:
+                continue
+            disc = b * b - 4.0 * a * c
+            if disc < 0.0:
+                continue
+            sqrt_disc = math.sqrt(disc)
+            roots = [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)]
+            positive_roots = [root for root in roots if root >= 0.0]
+            if not positive_roots:
+                continue
+            ttc = min(positive_roots)
+            if ttc < min_ttc:
+                min_ttc = ttc
+            if ttc < threshold:
+                risk = (threshold - ttc) / threshold
+                max_risk = max(max_risk, float(np.clip(risk * risk, 0.0, 1.0)))
+
+        if not math.isfinite(min_ttc):
+            return 0.0, max_risk
+        return float(min_ttc), float(max_risk)
+
     def _debug_draw_waypoints_and_lateral(self, life_time=0.1):
         if len(self.waypoints) == 0:
             return

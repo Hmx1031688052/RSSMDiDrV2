@@ -121,6 +121,10 @@ class Agent(nj.Module):
             else:
                 value = value.astype(jnp.float32)
             obs[key] = value
+        if "is_collision" not in obs:
+            obs["is_collision"] = jnp.zeros_like(obs["is_terminal"], dtype=jnp.float32)
+        else:
+            obs["is_collision"] = obs["is_collision"].astype(jnp.float32).reshape(obs["is_terminal"].shape)
         obs["cont"] = 1.0 - obs["is_terminal"].astype(jnp.float32)
         return obs
 
@@ -138,6 +142,7 @@ class WorldModel(nj.Module):
             "decoder": nets.MultiDecoder(shapes, **config.decoder, name="dec"),
             "reward": nets.MLP((), **config.reward_head, name="rew"),
             "cont": nets.MLP((), **config.cont_head, name="cont"),
+            "collision": nets.MLP((), **config.collision_head, name="collision"),
         }
         self.opt = jaxutils.Optimizer(name="model_opt", **config.model_opt)
         scales = self.config.loss_scales.copy()
@@ -261,6 +266,9 @@ class WorldModel(nj.Module):
         if "cont" in dists and not self.config.jax.debug_nans:
             stats = jaxutils.balance_stats(dists["cont"], data["cont"], 0.5)
             metrics.update({f"cont_{k}": v for k, v in stats.items()})
+        if "collision" in dists and not self.config.jax.debug_nans:
+            stats = jaxutils.balance_stats(dists["collision"], data["is_collision"], 0.5)
+            metrics.update({f"collision_{k}": v for k, v in stats.items()})
         return metrics
 
 

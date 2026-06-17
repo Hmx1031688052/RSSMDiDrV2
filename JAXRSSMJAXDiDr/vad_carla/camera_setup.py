@@ -6,8 +6,8 @@ the camera order stable when exporting tensors:
     CAM_FRONT, CAM_FRONT_RIGHT, CAM_FRONT_LEFT,
     CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT
 
-The helpers here live under JAXRSSMJAXDiDr so the VAD/RSSM pipeline can be used
-without adding new task files to the legacy RSSMDiDrOnCarla package.
+The helpers here live under JAXRSSMJAXDiDr so the VAD/RSSM pipeline stays
+self-contained inside the JAX package.
 """
 
 from __future__ import annotations

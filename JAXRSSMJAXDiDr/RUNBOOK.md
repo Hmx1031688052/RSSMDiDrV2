@@ -58,8 +58,15 @@ expert_waypoints8
 If you already have prepared PolyPlanner expert replay in `$REPLAY_DIR`, skip
 this step.
 
-Use your existing expert collection/preparation pipeline under `dreamerv3/` and
-`RSSMDiDrOnCarla/`. The JAX planner pipeline consumes the same replay format as
+Use your existing expert collection pipeline under `dreamerv3/`, then prepare
+the replay through the JAX package:
+
+```bash
+python -m JAXRSSMJAXDiDr.scripts.prepare_polyplanner_replay \
+  --replay_dir "$REPLAY_DIR"
+```
+
+The JAX planner pipeline consumes the same Dreamer row-format replay fields as
 the previous RSSM/DiDr scripts.
 
 Quick check:
@@ -84,16 +91,19 @@ If you already have a good JAX DreamerV3 RSSM checkpoint, reuse it:
 
 ```bash
 export JAX_RSSM_CKPT=/media/pc/T7/Hmx_RssmDIDR/RSSMDIDR/outputs/rssm_didr_roundabout/offline_rssm/checkpoint.ckpt
+```
 
 If not, train one with the existing JAX RSSM implementation:
 
 ```bash
-python -m RSSMDiDrOnCarla.scripts.train_offline_rssm \
+python -m JAXRSSMJAXDiDr.scripts.train_offline_rssm \
+  --task carla_roundabout \
   --replay_dir "$REPLAY_DIR" \
   --logdir "$RUN_ROOT/jax_rssm" \
   --batch_length 64 \
   --batch_size 16 \
-  --updates 100000
+  --updates 100000 \
+  --structured_world_model
 
 export JAX_RSSM_CKPT=$RUN_ROOT/jax_rssm/checkpoint.ckpt
 ```
@@ -106,11 +116,12 @@ this JAX planner path.
 Export posterior latents from the JAX RSSM checkpoint:
 
 ```bash
-python -m RSSMDiDrOnCarla.scripts.export_rssm_latents \
+python -m JAXRSSMJAXDiDr.scripts.export_rssm_latents \
   --checkpoint "$JAX_RSSM_CKPT" \
   --replay_dir "$REPLAY_DIR" \
   --output_dir "$RUN_ROOT/jax_latents" \
-  --task carla_roundabout
+  --task carla_roundabout \
+  --structured_world_model
 ```
 
 Expected output:
@@ -132,7 +143,7 @@ deter / stoch components unless --no_save_components was used
 Pair replay targets with exported RSSM latents:
 
 ```bash
-python -m RSSMDiDrOnCarla.scripts.export_planner_dataset \
+python -m JAXRSSMJAXDiDr.scripts.export_planner_dataset \
   --replay_dir "$REPLAY_DIR" \
   --latent_dir "$RUN_ROOT/jax_latents" \
   --output_dir "$RUN_ROOT/jax_planner_dataset"
@@ -163,6 +174,15 @@ PY
 ```
 
 ## 5. Pretrain JAX DiffusionDrive Planner
+
+Build plan anchors from the prepared replay:
+
+```bash
+python -m JAXRSSMJAXDiDr.tools.kmeans_polyplanner_anchors \
+  --replay_dir "$REPLAY_DIR" \
+  --output "$ANCHOR_PATH" \
+  --num_modes 20
+```
 
 Train the JAX planner from scratch:
 
@@ -302,7 +322,8 @@ python -m JAXRSSMJAXDiDr.scripts.train_jax_online_finetune \
   --lambda_ 0.95 \
   --bc_weight 0.1 \
   --wp_smooth_weight 0.05 \
-  --ctrl_smooth_weight 0.05
+  --ctrl_smooth_weight 0.05 \
+  --structured_world_model
 ```
 
 Actor update data flow:
@@ -355,7 +376,8 @@ python -m JAXRSSMJAXDiDr.scripts.train_jax_online_finetune \
   --online_replay_dir "$RUN_ROOT/jax_online_replay" \
   --rssm_checkpoint "$JAX_RSSM_CKPT" \
   --planner_checkpoint "$RUN_ROOT/jax_didr_planner/best.pkl.gz" \
-  --output_dir "$RUN_ROOT/jax_didr_online_mixed"
+  --output_dir "$RUN_ROOT/jax_didr_online_mixed" \
+  --structured_world_model
 ```
 
 Evaluate the pretrained JAX planner:
@@ -371,10 +393,10 @@ python -m JAXRSSMJAXDiDr.scripts.eval_close_loop \
   --plan_interval_steps 5 \
   --eval_timestep 0 \
   --env.planner_target.use_waypoint_action False \
-  --dreamerv3.encoder.cnn_keys "birdeye_wpt" \
-  --dreamerv3.encoder.mlp_keys "ego_speed|ego_yawrate|ego_x|ego_y|ego_yaw" \
-  --dreamerv3.decoder.cnn_keys "birdeye_wpt" \
-  --dreamerv3.decoder.mlp_keys "ego_speed|ego_yawrate" \
+  --dreamerv3.encoder.cnn_keys none \
+  --dreamerv3.decoder.cnn_keys none \
+  --dreamerv3.encoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining" \
+  --dreamerv3.decoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining" \
   --live_plot \
   --plot_modes 6 \
 ```
@@ -390,7 +412,11 @@ python -m JAXRSSMJAXDiDr.scripts.eval_close_loop \
   --episodes 10 \
   --max_steps 1000 \
   --plan_interval_steps 5 \
-  --eval_timestep 8
+  --eval_timestep 8 \
+  --dreamerv3.encoder.cnn_keys none \
+  --dreamerv3.decoder.cnn_keys none \
+  --dreamerv3.encoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining" \
+  --dreamerv3.decoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining"
 ```
 Online replay must keep:
 

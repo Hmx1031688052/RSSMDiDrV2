@@ -134,6 +134,16 @@ class CarlaWptEnv(CarlaBaseEnv):
             self._get_neighbor_vehicles_world,
             spaces.Box(-np.inf, np.inf, (self._neighbor_k * 12,), np.float32),
         )
+        self._observer.register_simple_handler(
+            "target_region",
+            self._get_target_region,
+            spaces.Box(0.0, 1.0, (1,), np.float32),
+        )
+        self._observer.register_simple_handler(
+            "route_remaining",
+            self._get_route_remaining,
+            spaces.Box(0.0, 1.0, (1,), np.float32),
+        )
 
         cfg = getattr(self._config, "planner_target", None)
         if cfg is None or not bool(getattr(cfg, "enable", True)):
@@ -212,6 +222,23 @@ class CarlaWptEnv(CarlaBaseEnv):
                         or None to clear and fall back to global route.
         """
         self.external_traj_world = traj_world
+
+    def _get_target_region(self, env_state=None):
+        del env_state
+        return np.asarray([1.0 if self.is_destination_reached() else 0.0], dtype=np.float32)
+
+    def _get_route_remaining(self, env_state=None):
+        del env_state
+        norm = 200.0
+        reward_cfg = getattr(self._config, "reward", None)
+        if reward_cfg is not None:
+            try:
+                norm = float(reward_cfg.get("route_remaining_norm", norm))
+            except Exception:
+                norm = float(getattr(reward_cfg, "route_remaining_norm", norm))
+        norm = max(norm, 1.0)
+        remaining = float(len(getattr(self, "waypoints", []))) / norm
+        return np.asarray([np.clip(remaining, 0.0, 1.0)], dtype=np.float32)
 
     def _get_expert_waypoints8_local(self, env_state=None):
         """Sample 8 waypoints from external trajectory (preferred) or global route."""
