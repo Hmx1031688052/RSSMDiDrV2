@@ -177,7 +177,11 @@ class WorldModel(nj.Module):
         losses["dyn"] = self.rssm.dyn_loss(post, prior, **self.config.dyn_loss)
         losses["rep"] = self.rssm.rep_loss(post, prior, **self.config.rep_loss)
         for key, dist in dists.items():
-            loss = -dist.log_prob(data[key].astype(jnp.float32))
+            value = data[key].astype(jnp.float32)
+            target_shape = tuple(dist.batch_shape) + tuple(dist.event_shape)
+            if value.shape != target_shape:
+                value = value.reshape(target_shape)
+            loss = -dist.log_prob(value)
             assert loss.shape == embed.shape[:2], (key, loss.shape)
             losses[key] = loss
         scaled = {k: v * self.scales[k] for k, v in losses.items()}
