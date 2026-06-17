@@ -24,6 +24,7 @@ cd /media/pc/T7/Hmx_RssmDIDR/TorchWMDIDR
 Set paths:
 
 ```bash
+conda activate cardreamer
 export RUN_ROOT=./outputs/jaxrssm_jaxdidr
 export COLLECT_LOGDIR=${RUN_ROOT}/expert_collect
 export REPLAY_DIR=${COLLECT_LOGDIR}/replay
