@@ -29,7 +29,7 @@ ckpt/
 *.pkl
 *.ckpt
 *.safetensors
-
+*.md
 # Datasets
 dataset/
 datasets/
