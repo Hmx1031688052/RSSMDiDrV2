@@ -251,7 +251,14 @@ class MultiEncoder(nj.Module):
             output = output.reshape((output.shape[0], -1))
             outputs.append(output)
         if self.mlp_shapes:
-            inputs = [data[k][..., None] if len(self.shapes[k]) == 0 else data[k] for k in self.mlp_shapes]
+            inputs = []
+            for k in self.mlp_shapes:
+                x = data[k]
+                if len(self.shapes[k]) == 0:
+                    x = x[..., None]
+                if x.ndim > 2:
+                    x = x.reshape(x.shape[0], -1)
+                inputs.append(x)
             inputs = jnp.concatenate([x.astype(f32) for x in inputs], -1)
             inputs = jaxutils.cast_to_compute(inputs)
             outputs.append(self._mlp(inputs))
