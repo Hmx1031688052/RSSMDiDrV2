@@ -27,7 +27,7 @@ class JAXDiDrConfig:
     plan_anchor_path: str
     condition_key: str = "rssm_latent"
     hidden_dim: int = 256
-    num_modes: int = 20
+    num_modes: int = 30
     num_poses: int = 8
     waypoint_scale: float = 30.0
     diffusion_train_steps: int = 1000

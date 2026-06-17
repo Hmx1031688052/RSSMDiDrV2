@@ -24,7 +24,6 @@ cd /media/pc/T7/Hmx_RssmDIDR/TorchWMDIDR
 Set paths:
 
 ```bash
-conda activate cardreamer
 export RUN_ROOT=./outputs/jaxrssm_jaxdidr
 export COLLECT_LOGDIR=${RUN_ROOT}/expert_collect
 export REPLAY_DIR=${COLLECT_LOGDIR}/replay
@@ -69,6 +68,36 @@ python -m JAXRSSMJAXDiDr.scripts.prepare_polyplanner_replay \
 
 The JAX planner pipeline consumes the same Dreamer row-format replay fields as
 the previous RSSM/DiDr scripts.
+
+Optional: replace `expert_waypoints8` with the ego vehicle's actually executed
+future trajectory. Use this when you want the planner target to be the
+closed-loop ego path from replay rather than the PolyPlanner/global-route
+target. The script edits replay chunks in place, so copy the replay directory
+first if you want to keep the original expert targets:
+
+```bash
+cp -a "$REPLAY_DIR" "${REPLAY_DIR}_polyplanner_backup"
+
+python -u dreamerv3/replace_expert_with_ego_traj.py \
+  --replay_dir "$REPLAY_DIR" \
+  --waypoint_scale 30.0 \
+  --dt 0.1 \
+  --waypoint_interval 5
+```
+
+This writes:
+
+```text
+expert_waypoints8: [T, 16]
+```
+
+as 8 future ego-frame waypoints, spaced by `waypoint_interval * dt`
+seconds. With the defaults above, this is 8 waypoints at 0.5s intervals,
+covering a 4.0s horizon. The replay chunks must contain `ego_x`, `ego_y`, and
+preferably `ego_yaw`; chunks without ego positions are skipped. Run this before
+building anchors or exporting the planner dataset. If you already built
+`$ANCHOR_PATH` or `$RUN_ROOT/jax_planner_dataset`, regenerate them after this
+replacement.
 
 Quick check:
 
@@ -182,7 +211,9 @@ Build plan anchors from the prepared replay:
 python -m JAXRSSMJAXDiDr.tools.kmeans_polyplanner_anchors \
   --replay_dir "$REPLAY_DIR" \
   --output "$ANCHOR_PATH" \
-  --num_modes 20
+  --num_modes 30
+python -m JAXRSSMJAXDiDr.tools.checkanchors \
+  --anchor_path /media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/anchors.npy
 ```
 
 Train the JAX planner from scratch:
