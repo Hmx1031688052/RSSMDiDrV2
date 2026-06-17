@@ -196,48 +196,19 @@ python -m JAXRSSMJAXDiDr.scripts.train_jax_planner_pretrain \
   --lr 1e-4 \
   --weight_decay 1e-4 \
   --dropout 0.1 \
+  --trajectory_cls_weight 10.0 \
+  --trajectory_reg_weight 8.0 \
   --latent_noise_std 0.03
 
 ```
-export RUN_ROOT=./outputs/jaxrssm_jaxdidr
-export REPLAY_DIR="$RUN_ROOT/expert_collect/replay"
-export JAX_RSSM_CKPT="$RUN_ROOT/jax_rssm/checkpoint.ckpt"
-export ANCHOR_PATH="$RUN_ROOT/anchors.npy"
-export PLANNER_CKPT="$RUN_ROOT/jax_didr_planner/best.pkl.gz"
-python -m JAXRSSMJAXDiDr.scripts.train_jax_stable_online_finetune \
-  --task carla_roundabout \
-  --offline_replay_dir "$REPLAY_DIR" \
-  --rssm_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/jax_stable_online/rssm_online/checkpoint.ckpt" \
-  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/jax_stable_online/planner_selector_online_outer_0007.pkl.gz" \
-  --anchor_path "$ANCHOR_PATH" \
-  --output_dir "$RUN_ROOT/jax_stable_online_continue616" \
-  --outer_iterations 30 \
-  --collect_episodes 20 \
-  --max_steps 1000 \
-  --plan_interval_steps 5 \
-  --wm_updates 200 \
-  --selector_updates 300 \
-  --batch_length 64 \
-  --batch_size 16 \
-  --score_horizon_steps 15 \
-  --offline_ratio 0.7 \
-  --eval_timestep 8 \
-  --jax_platform gpu \
-  --dreamerv3.jax.train_devices=0 \
-  --env.planner_target.use_waypoint_action False \
-  --dreamerv3.encoder.cnn_keys "birdeye_wpt" \
-  --dreamerv3.encoder.mlp_keys "ego_speed|ego_yawrate|ego_x|ego_y|ego_yaw" \
-  --dreamerv3.decoder.cnn_keys "birdeye_wpt" \
-  --dreamerv3.decoder.mlp_keys "ego_speed|ego_yawrate"
-The supervised planner loss matches the TorchDiDr planner:
+
+The supervised planner loss follows `DiffusionDriveV2/modules/multimodal_loss.py`:
 
 ```text
-loss =
-  reg_loss
-  + cls_loss
-  + 0.05 * path_length_loss
-  + 0.05 * step_length_loss
-  + 0.01 * smooth_loss
+positive mode = argmin mean L2(target_xy, plan_anchor_xy)
+cls_loss = 10.0 * sigmoid_focal_loss(poses_cls, one_hot(positive mode), gamma=2, alpha=0.25)
+reg_loss = 8.0 * L1(poses_reg[positive mode], target_trajectory)
+loss = cls_loss + reg_loss
 ```
 
 Expected outputs:
@@ -261,27 +232,7 @@ python -m JAXRSSMJAXDiDr.scripts.eval_open_loop \
   --eval_timestep 0 \
   --save_predictions
 ```
-python -m JAXRSSMJAXDiDr.scripts.eval_close_loop \
-  --task carla_roundabout \
-  --rssm_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/jax_rssm/checkpoint.ckpt" \
-  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/jax_didr_planner/best.pkl.gz" \
-  --anchor_path "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/rssm_didr_roundabout/anchors.npy" \
-  --output_dir "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/jax_didr_closed_loop_vis" \
-  --episodes 10 \
-  --max_steps 1000 \
-  --device auto \
-  --jax_platform cpu \
-  --eval_timestep 0 \
-  --env.planner_target.use_waypoint_action False \
-  --dreamerv3.jax.train_devices=0 \
-  --dreamerv3.encoder.cnn_keys "birdeye_wpt" \
-  --dreamerv3.encoder.mlp_keys "ego_speed|ego_yawrate|ego_x|ego_y|ego_yaw" \
-  --dreamerv3.decoder.cnn_keys "birdeye_wpt" \
-  --dreamerv3.decoder.mlp_keys "ego_speed|ego_yawrate" \
-  --live_plot \
-  --plot_modes 6 \
-  --carla_live_draw \
-  --carla_spectator_topdown
+
 Expected outputs:
 
 ```text

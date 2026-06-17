@@ -249,6 +249,20 @@ def make_noisy_xy(model, batch_size: int, device: torch.device, args: argparse.N
     return model._denormalize_xy(noisy), timesteps
 
 
+def sigmoid_focal_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: float = 0.25,
+) -> torch.Tensor:
+    pred_sigmoid = pred.sigmoid()
+    target = target.type_as(pred)
+    pt = (1 - pred_sigmoid) * target + pred_sigmoid * (1 - target)
+    focal_weight = (alpha * target + (1 - alpha) * (1 - target)) * pt.pow(gamma)
+    loss = F.binary_cross_entropy_with_logits(pred, target, reduction="none") * focal_weight
+    return loss.mean()
+
+
 def metric_sums(model, latent: np.ndarray, trajectory: np.ndarray, device: torch.device, args: argparse.Namespace):
     totals = {
         "samples": 0,
@@ -299,9 +313,11 @@ def metric_sums(model, latent: np.ndarray, trajectory: np.ndarray, device: torch
                 mode_idx[:, None, None, None].repeat(1, 1, model.config.num_poses, 2),
             ).squeeze(1)
 
-            reg_loss = F.l1_loss(oracle, target_t)
-            cls_loss = F.cross_entropy(poses_cls, mode_idx)
-            loss = model.config.reg_loss_weight * reg_loss + model.config.cls_loss_weight * cls_loss
+            cls_target = torch.zeros_like(poses_cls)
+            cls_target.scatter_(1, mode_idx.unsqueeze(1), 1)
+            reg_loss = model.config.reg_loss_weight * F.l1_loss(oracle, target_t)
+            cls_loss = model.config.cls_loss_weight * sigmoid_focal_loss(poses_cls, cls_target)
+            loss = reg_loss + cls_loss
             oracle_ade = torch.linalg.norm(oracle[..., :2] - target_t[..., :2], dim=-1).mean()
             oracle_fde = torch.linalg.norm(oracle[..., -1, :2] - target_t[..., -1, :2], dim=-1).mean()
             selected_ade = torch.linalg.norm(selected[..., :2] - target_t[..., :2], dim=-1).mean()

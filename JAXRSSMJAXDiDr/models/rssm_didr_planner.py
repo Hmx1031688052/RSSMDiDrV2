@@ -33,8 +33,8 @@ class RSSMDiDrConfig:
     decoder_heads: int = 4
     decoder_ffn_dim: int = 512
     dropout: float = 0.1
-    reg_loss_weight: float = 1.0
-    cls_loss_weight: float = 0.5
+    reg_loss_weight: float = 8.0
+    cls_loss_weight: float = 10.0
     latent_noise_std: float = 0.0
     latent_dropout: float = 0.0
 
@@ -229,27 +229,55 @@ class RSSMDiffusionDrivePlanner(nn.Module):
         gather_idx = mode_idx[:, None, None, None].repeat(1, 1, self.config.num_poses, 3)
         return torch.gather(poses_reg, 1, gather_idx).squeeze(1)
 
+    @staticmethod
+    def sigmoid_focal_loss(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        gamma: float = 2.0,
+        alpha: float = 0.25,
+    ) -> torch.Tensor:
+        pred_sigmoid = pred.sigmoid()
+        target = target.type_as(pred)
+        pt = (1 - pred_sigmoid) * target + pred_sigmoid * (1 - target)
+        focal_weight = (alpha * target + (1 - alpha) * (1 - target)) * pt.pow(gamma)
+        loss = F.binary_cross_entropy_with_logits(pred, target, reduction="none") * focal_weight
+        return loss.mean()
+
     def compute_loss(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         poses_reg = predictions["poses_reg"]
         poses_cls = predictions["poses_cls"]
         target_traj = targets["trajectory"].float()
+        batch, num_modes = poses_cls.shape
         plan_anchor = self.plan_anchor.to(target_traj.device).unsqueeze(0).repeat(target_traj.shape[0], 1, 1, 1)
 
         dist = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - plan_anchor, dim=-1).mean(dim=-1)
         mode_idx = torch.argmin(dist, dim=-1)
         gather_idx = mode_idx[:, None, None, None].repeat(1, 1, self.config.num_poses, 3)
         best_reg = torch.gather(poses_reg, 1, gather_idx).squeeze(1)
+        cls_target = torch.zeros(
+            (batch, num_modes),
+            dtype=poses_cls.dtype,
+            layout=poses_cls.layout,
+            device=poses_cls.device,
+        )
+        cls_target.scatter_(1, mode_idx.unsqueeze(1), 1)
 
-        reg_loss = F.l1_loss(best_reg, target_traj)
-        cls_loss = F.cross_entropy(poses_cls, mode_idx)
-        loss = self.config.reg_loss_weight * reg_loss + self.config.cls_loss_weight * cls_loss
+        cls_loss_raw = self.sigmoid_focal_loss(poses_cls, cls_target, gamma=2.0, alpha=0.25)
+        reg_loss_raw = F.l1_loss(best_reg, target_traj)
+        cls_loss = self.config.cls_loss_weight * cls_loss_raw
+        reg_loss = self.config.reg_loss_weight * reg_loss_raw
+        loss = cls_loss + reg_loss
         ade = torch.linalg.norm(best_reg[..., :2] - target_traj[..., :2], dim=-1).mean()
         fde = torch.linalg.norm(best_reg[..., -1, :2] - target_traj[..., -1, :2], dim=-1).mean()
+        selected_idx = poses_cls.argmax(dim=-1)
 
         return {
             "loss": loss,
             "reg_loss": reg_loss.detach(),
+            "reg_loss_raw": reg_loss_raw.detach(),
             "cls_loss": cls_loss.detach(),
+            "cls_loss_raw": cls_loss_raw.detach(),
+            "mode_cls_acc": (selected_idx == mode_idx).float().mean().detach(),
             "ade": ade.detach(),
             "fde": fde.detach(),
         }
