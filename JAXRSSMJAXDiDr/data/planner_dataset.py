@@ -90,7 +90,16 @@ class PlannerDataset:
             batch_idx = indices[start : start + int(batch_size)]
             if drop_last and len(batch_idx) < int(batch_size):
                 continue
-            rows = [self.get(i) for i in batch_idx]
+            chunk_cache = {}
+            rows = []
+            for index in batch_idx:
+                path, local = self._locate(int(index))
+                if path not in chunk_cache:
+                    chunk_cache[path] = _load_npz(path)
+                chunk = chunk_cache[path]
+                cond = np.asarray(chunk[self.condition_key][local], dtype=np.float32).reshape(-1)
+                traj = np.asarray(chunk["trajectory"][local], dtype=np.float32)
+                rows.append({self.condition_key: cond, "condition": cond, "trajectory": traj})
             keys = rows[0].keys()
             yield {key: np.stack([row[key] for row in rows], axis=0).astype(np.float32) for key in keys}
 
