@@ -258,9 +258,9 @@ Evaluate ADE/FDE on the planner dataset:
 
 ```bash
 python -m JAXRSSMJAXDiDr.scripts.eval_open_loop \
-  --dataset_dir "$RUN_ROOT/jax_planner_dataset" \
-  --planner_checkpoint "$RUN_ROOT/jax_didr_planner/best.pkl.gz" \
-  --output_dir "$RUN_ROOT/jax_didr_eval" \
+  --dataset_dir "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/jax_planner_dataset" \
+  --planner_checkpoint "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/jax_didr_planner/epoch_0068.pkl.gz" \
+  --output_dir "/media/pc/T7/Hmx_RssmDIDR/RSSMDiDrV2/outputs/jaxrssm_jaxdidr/jax_didr_eval_openloop" \
   --eval_timestep 0 \
   --save_predictions
 ```
