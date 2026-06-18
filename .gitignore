@@ -30,6 +30,7 @@ ckpt/
 *.ckpt
 *.safetensors
 *.md
+*.zip
 # Datasets
 dataset/
 datasets/
