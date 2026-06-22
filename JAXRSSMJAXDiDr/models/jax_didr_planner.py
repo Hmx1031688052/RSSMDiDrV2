@@ -300,6 +300,178 @@ def deterministic_anchors(params: PyTree, config: JAXDiDrConfig, batch_size: int
     return noisy * float(config.waypoint_scale), timesteps
 
 
+def _ddim_variance(alpha_t, alpha_prev):
+    return (1.0 - alpha_prev) / jnp.maximum(1.0 - alpha_t, 1e-8) * (1.0 - alpha_t / jnp.maximum(alpha_prev, 1e-8))
+
+
+def ddim_step_with_logprob(
+    model_output,
+    timestep: int,
+    sample,
+    train_steps: int,
+    prev_timestep: int = -1,
+    eta: float = 1.0,
+    rng=None,
+    prev_sample=None,
+    min_logprob_std: float = 0.1,
+    multiplicative_noise: bool = True,
+):
+    """DDIM sample step with a diffusion-policy log probability.
+
+    `model_output` is the predicted clean normalized trajectory x_0 and
+    `sample` is the current normalized trajectory x_t.
+    """
+
+    alpha_cumprod = diffusion_alpha_cumprod(train_steps)
+    alpha_t = alpha_cumprod[jnp.asarray(timestep, dtype=jnp.int32)]
+    alpha_prev = jnp.where(
+        jnp.asarray(prev_timestep) >= 0,
+        alpha_cumprod[jnp.maximum(jnp.asarray(prev_timestep, dtype=jnp.int32), 0)],
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    beta_t = 1.0 - alpha_t
+    pred_epsilon = (sample - jnp.sqrt(alpha_t) * model_output) / jnp.sqrt(jnp.maximum(beta_t, 1e-8))
+    variance = jnp.maximum(_ddim_variance(alpha_t, alpha_prev), 0.0)
+    sigma = jnp.asarray(float(eta), dtype=sample.dtype) * jnp.sqrt(variance)
+    direction_scale = jnp.sqrt(jnp.maximum(1.0 - alpha_prev - jnp.square(sigma), 0.0))
+    prev_sample_mean = jnp.sqrt(alpha_prev) * model_output + direction_scale * pred_epsilon
+
+    if prev_sample is None:
+        if rng is None:
+            raise ValueError("rng is required when prev_sample is not provided")
+        noise = jax.random.normal(rng, sample.shape, dtype=sample.dtype)
+        if multiplicative_noise:
+            prev_sample = prev_sample_mean * (1.0 + sigma * noise)
+        else:
+            prev_sample = prev_sample_mean + sigma * noise
+
+    logprob_std = jnp.maximum(sigma, jnp.asarray(float(min_logprob_std), dtype=sample.dtype))
+    log_prob = (
+        -jnp.square(jax.lax.stop_gradient(prev_sample) - prev_sample_mean) / (2.0 * jnp.square(logprob_std))
+        - jnp.log(logprob_std)
+        - 0.5 * jnp.log(2.0 * jnp.pi)
+    )
+    log_prob = log_prob.sum(axis=(-2, -1))
+    return prev_sample.astype(sample.dtype), log_prob.astype(sample.dtype), prev_sample_mean.astype(sample.dtype)
+
+
+def _grpo_roll_timesteps(trunc_timestep: int, step_num: int):
+    if int(step_num) <= 0:
+        raise ValueError("step_num must be positive")
+    if int(step_num) == 1:
+        return [int(trunc_timestep)]
+    return np.rint(np.linspace(int(trunc_timestep), 0, int(step_num))).astype(np.int32).tolist()
+
+
+def _decode_diffusion_sample(params: PyTree, config: JAXDiDrConfig, latent, normalized_sample, timestep: int):
+    noisy_xy = jnp.clip(normalized_sample, -1.0, 1.0) * float(config.waypoint_scale)
+    timesteps = jnp.full((latent.shape[0],), int(timestep), dtype=jnp.int32)
+    poses_reg, poses_cls = _decode(params, config, latent, noisy_xy, timesteps, training=False)
+    x_start = poses_reg[..., :2] / float(config.waypoint_scale)
+    return jnp.clip(x_start, -1.0, 1.0), poses_reg, poses_cls
+
+
+def sample_diffusion_chain_with_logprob(
+    params: PyTree,
+    config: JAXDiDrConfig,
+    latent,
+    rng,
+    groups: int = 4,
+    step_num: int = 10,
+    trunc_timestep: int = 8,
+    eta: float = 1.0,
+    min_logprob_std: float = 0.1,
+    multiplicative_noise: bool = True,
+):
+    """Sample grouped planner diffusion chains for GRPO fine-tuning."""
+
+    batch = latent.shape[0]
+    modes = int(config.num_modes)
+    anchor = jax.lax.stop_gradient(params["plan_anchor"]) / float(config.waypoint_scale)
+    anchor = jnp.broadcast_to(anchor, (batch, int(groups), modes, int(config.num_poses), 2))
+    sample = anchor.reshape((batch, int(groups) * modes, int(config.num_poses), 2))
+    alpha = diffusion_alpha_cumprod(int(config.diffusion_train_steps))[int(trunc_timestep)]
+    noise_rng, step_rng = jax.random.split(rng)
+    noise = jax.random.normal(noise_rng, sample.shape, dtype=sample.dtype)
+    sample = jnp.sqrt(alpha) * sample + jnp.sqrt(1.0 - alpha) * noise
+
+    chain = [sample]
+    log_probs = []
+    timesteps = _grpo_roll_timesteps(int(trunc_timestep), int(step_num))
+    rng = step_rng
+    for step_idx in range(int(step_num)):
+        rng, step_rng = jax.random.split(rng)
+        timestep = int(timesteps[step_idx])
+        prev_timestep = int(timesteps[step_idx + 1]) if step_idx + 1 < int(step_num) else -1
+        model_output, _, _ = _decode_diffusion_sample(params, config, latent, sample, timestep)
+        sample, log_prob, _ = ddim_step_with_logprob(
+            model_output,
+            timestep,
+            sample,
+            int(config.diffusion_train_steps),
+            prev_timestep=prev_timestep,
+            eta=float(eta),
+            rng=step_rng,
+            min_logprob_std=float(min_logprob_std),
+            multiplicative_noise=bool(multiplicative_noise),
+        )
+        chain.append(sample)
+        log_probs.append(log_prob.reshape((batch, int(groups), modes)))
+
+    chain = jnp.stack(chain, axis=-1)
+    log_probs = jnp.stack(log_probs, axis=-1)
+    final_xy = chain[..., -1].reshape((batch, int(groups), modes, int(config.num_poses), 2))
+    final_xy = final_xy * float(config.waypoint_scale)
+    return {"chain": chain, "log_probs": log_probs, "final_xy": final_xy}
+
+
+def recompute_diffusion_chain_logprob(
+    params: PyTree,
+    config: JAXDiDrConfig,
+    latent,
+    chain,
+    groups: int = 4,
+    step_num: int = 10,
+    trunc_timestep: int = 8,
+    eta: float = 1.0,
+    min_logprob_std: float = 0.1,
+    multiplicative_noise: bool = True,
+):
+    """Recompute current-policy log probabilities on a fixed diffusion chain."""
+
+    batch = latent.shape[0]
+    modes = int(config.num_modes)
+    timesteps = _grpo_roll_timesteps(int(trunc_timestep), int(step_num))
+    log_probs = []
+    pred_xy_steps = []
+    for step_idx in range(int(step_num)):
+        timestep = int(timesteps[step_idx])
+        prev_timestep = int(timesteps[step_idx + 1]) if step_idx + 1 < int(step_num) else -1
+        sample = chain[..., step_idx]
+        prev_sample = chain[..., step_idx + 1]
+        model_output, poses_reg, _ = _decode_diffusion_sample(params, config, latent, sample, timestep)
+        _, log_prob, _ = ddim_step_with_logprob(
+            model_output,
+            timestep,
+            sample,
+            int(config.diffusion_train_steps),
+            prev_timestep=prev_timestep,
+            eta=float(eta),
+            prev_sample=prev_sample,
+            min_logprob_std=float(min_logprob_std),
+            multiplicative_noise=bool(multiplicative_noise),
+        )
+        log_probs.append(log_prob.reshape((batch, int(groups), modes)))
+        pred_xy_steps.append(
+            poses_reg[..., :2].reshape((batch, int(groups), modes, int(config.num_poses), 2))
+        )
+    log_probs = jnp.stack(log_probs, axis=-1)
+    pred_xy_steps = jnp.stack(pred_xy_steps, axis=-1)
+    final_xy = chain[..., -1].reshape((batch, int(groups), modes, int(config.num_poses), 2))
+    final_xy = final_xy * float(config.waypoint_scale)
+    return {"log_probs": log_probs, "final_xy": final_xy, "pred_xy_steps": pred_xy_steps}
+
+
 def select_best(poses_reg, poses_cls):
     idx = jnp.argmax(poses_cls, axis=-1)
     return poses_reg[jnp.arange(poses_reg.shape[0]), idx]
