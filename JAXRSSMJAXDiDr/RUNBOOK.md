@@ -410,7 +410,121 @@ action == executed_control
 
 Do not store waypoint as `action`.
 
-## 9. VAD Six-Camera Perception Latents
+## 9. Stable Online RSSM/Selector Finetune
+
+`train_jax_stable_online_finetune` is the conservative online loop:
+
+```text
+collect CARLA replay with the current planner
+ -> update the Dreamer/JAX RSSM from mixed offline + online replay
+ -> freeze/snapshot the updated RSSM for candidate scoring
+ -> score every planner mode through RSSM imagination
+ -> update only the planner selector_head
+```
+
+This differs from `train_jax_online_finetune`: it does not train a critic and
+it does not update the whole planner. It updates the world model online and
+fine-tunes only the JAX planner `selector_head`.
+
+Run after you have:
+
+```text
+$REPLAY_DIR                         offline Dreamer row-format replay
+$JAX_RSSM_CKPT                      pretrained Dreamer/JAX RSSM checkpoint
+$RUN_ROOT/jax_didr_planner/best.pkl.gz  pretrained JAX DiDr planner checkpoint
+```
+
+Recommended first run:
+
+```bash
+python -m JAXRSSMJAXDiDr.scripts.train_jax_stable_online_finetune \
+  --offline_replay_dir "$REPLAY_DIR" \
+  --rssm_checkpoint "$JAX_RSSM_CKPT" \
+  --planner_checkpoint "$RUN_ROOT/jax_didr_planner/best.pkl.gz" \
+  --output_dir "$RUN_ROOT/jax_didr_stable_online" \
+  --task carla_roundabout \
+  --outer_iterations 10 \
+  --collect_episodes 2 \
+  --max_steps 1000 \
+  --plan_interval_steps 5 \
+  --wm_updates 200 \
+  --selector_updates 200 \
+  --batch_length 64 \
+  --batch_size 16 \
+  --offline_ratio 0.7 \
+  --eval_timestep 8 \
+  --score_horizon_steps 15 \
+  --selector_lr 1e-5 \
+  --structured_world_model
+```
+
+The script forwards unknown flags to the CARLA/Dreamer config parser. It also
+forces normalized `[acc, steer]` control actions by setting
+`env.planner_target.use_waypoint_action=False` when that flag is not provided.
+If Dreamer creates more than one train device, pass a single-device setting via
+the forwarded flags, for example:
+
+```bash
+  --dreamerv3.jax.train_devices "[0]"
+```
+
+For a replay-only smoke run without collecting new CARLA episodes:
+
+```bash
+python -m JAXRSSMJAXDiDr.scripts.train_jax_stable_online_finetune \
+  --offline_replay_dir "$REPLAY_DIR" \
+  --online_replay_dir "$RUN_ROOT/jax_online_replay" \
+  --rssm_checkpoint "$JAX_RSSM_CKPT" \
+  --planner_checkpoint "$RUN_ROOT/jax_didr_planner/best.pkl.gz" \
+  --output_dir "$RUN_ROOT/jax_didr_stable_online_replay_only" \
+  --task carla_roundabout \
+  --outer_iterations 1 \
+  --wm_updates 10 \
+  --selector_updates 10 \
+  --no_collect \
+  --structured_world_model
+```
+
+Expected outputs:
+
+```text
+$RUN_ROOT/jax_didr_stable_online/online_replay/*.npz
+$RUN_ROOT/jax_didr_stable_online/rssm_online/checkpoint.ckpt
+$RUN_ROOT/jax_didr_stable_online/planner_selector_online.pkl.gz
+$RUN_ROOT/jax_didr_stable_online/planner_selector_online_outer_*.pkl.gz
+$RUN_ROOT/jax_didr_stable_online/history.json
+$RUN_ROOT/jax_didr_stable_online/run_config.json
+```
+
+Evaluate the resulting pair together:
+
+```bash
+python -m JAXRSSMJAXDiDr.scripts.eval_close_loop \
+  --task carla_roundabout \
+  --rssm_checkpoint "$RUN_ROOT/jax_didr_stable_online/rssm_online/checkpoint.ckpt" \
+  --planner_checkpoint "$RUN_ROOT/jax_didr_stable_online/planner_selector_online.pkl.gz" \
+  --output_dir "$RUN_ROOT/jax_didr_stable_online_closed_loop" \
+  --episodes 10 \
+  --max_steps 1000 \
+  --plan_interval_steps 5 \
+  --eval_timestep 8 \
+  --dreamerv3.encoder.cnn_keys none \
+  --dreamerv3.decoder.cnn_keys none \
+  --dreamerv3.encoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining" \
+  --dreamerv3.decoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining"
+```
+
+Useful knobs:
+
+```text
+--offline_ratio          probability mass for offline replay when online replay exists
+--planner_output_unit    keep "meters" for current JAX planner checkpoints
+--anchor_path            optional anchor override, shape [num_modes, num_poses, 2]
+--ttc_penalty_weight     set 0 to disable imagined TTC risk penalty
+--save_every_outer       snapshot interval for planner_selector_online_outer_*.pkl.gz
+```
+
+## 10. VAD Six-Camera Perception Latents
 
 All VAD/CARLA helper programs for the JAX-only path live under
 `JAXRSSMJAXDiDr/`.
@@ -460,7 +574,7 @@ VAD-Tiny first: 100x100 BEV, 3 encoder layers, queue_length=3, about 16.8 FPS in
 VAD-Base later: 200x200 BEV, 6 encoder layers, queue_length=4, better open-loop metrics but about 4.5 FPS.
 ```
 
-## 10. Smoke Tests
+## 11. Smoke Tests
 
 Compile:
 
@@ -502,7 +616,7 @@ print("JAXRSSMJAXDiDr smoke OK")
 PY
 ```
 
-## 11. Output Summary
+## 12. Output Summary
 
 Main reusable artifacts:
 
@@ -518,6 +632,12 @@ JAX online planner checkpoint:
 
 JAX online critic checkpoint:
   $RUN_ROOT/jax_didr_online/critic_online.pkl.gz
+
+JAX stable online RSSM checkpoint:
+  $RUN_ROOT/jax_didr_stable_online/rssm_online/checkpoint.ckpt
+
+JAX stable online selector checkpoint:
+  $RUN_ROOT/jax_didr_stable_online/planner_selector_online.pkl.gz
 ```
 
 Use the JAX RSSM checkpoint plus JAX planner checkpoint together for future
