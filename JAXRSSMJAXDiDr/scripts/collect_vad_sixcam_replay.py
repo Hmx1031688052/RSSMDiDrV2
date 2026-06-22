@@ -8,6 +8,7 @@ without permanently modifying car_dreamer/configs/*.yaml.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from pathlib import Path
 import sys
 
@@ -19,6 +20,24 @@ if str(ROOT / "dreamerv3") not in sys.path:
     sys.path.insert(0, str(ROOT / "dreamerv3"))
 
 from JAXRSSMJAXDiDr.vad_carla import install_vad_carla_patches
+
+
+def load_collect_polyplanner():
+    """Load dreamerv3/collect_polyplanner.py without importing dreamerv3."""
+
+    module_name = "_dreamerv3_collect_polyplanner"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    module_path = ROOT / "dreamerv3" / "collect_polyplanner.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load collect_polyplanner from {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def parse_args(argv=None):
@@ -46,7 +65,7 @@ def main(argv=None) -> None:
     if "--task" not in rest:
         rest = ["--task", args.task, *rest]
 
-    from dreamerv3 import collect_polyplanner
+    collect_polyplanner = load_collect_polyplanner()
 
     print("[vad_collect] Enabled VAD camera keys in nuScenes order:")
     print("[vad_collect] CAM_FRONT, CAM_FRONT_RIGHT, CAM_FRONT_LEFT, CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT")

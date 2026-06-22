@@ -142,6 +142,103 @@ def make_img_meta(args: argparse.Namespace, cfg) -> dict:
     }
 
 
+def _step_scalar(chunk: Dict[str, np.ndarray], key: str, index: int) -> float:
+    if key not in chunk:
+        raise KeyError(f"Replay chunk is missing required ego field: {key}")
+    value = np.asarray(chunk[key][index])
+    return float(value.reshape(-1)[0])
+
+
+def _optional_step_scalar(
+    chunk: Dict[str, np.ndarray],
+    key: str,
+    index: int,
+    default: float = 0.0,
+) -> float:
+    if key not in chunk:
+        return float(default)
+    value = np.asarray(chunk[key][index])
+    return float(value.reshape(-1)[0])
+
+
+def _step_bool(chunk: Dict[str, np.ndarray], key: str, index: int) -> bool:
+    if key not in chunk:
+        return False
+    value = np.asarray(chunk[key][index])
+    return bool(np.any(value))
+
+
+def _is_sequence_start(chunk: Dict[str, np.ndarray], index: int) -> bool:
+    if index == 0:
+        return True
+    return (
+        _step_bool(chunk, "is_first", index)
+        or _step_bool(chunk, "episode_start", index)
+        or _step_bool(chunk, "reset_export", index)
+    )
+
+
+def _patch_angle_deg(yaw_rad: float) -> float:
+    return float(np.degrees(yaw_rad) % 360.0)
+
+
+def _ego_pose_from_chunk(chunk: Dict[str, np.ndarray], index: int) -> dict:
+    yaw = _step_scalar(chunk, "ego_yaw", index)
+    return {
+        "x": _step_scalar(chunk, "ego_x", index),
+        "y": _step_scalar(chunk, "ego_y", index),
+        "yaw": yaw,
+        "patch_angle": _patch_angle_deg(yaw),
+        "speed": _optional_step_scalar(chunk, "ego_speed", index),
+        "yawrate": _optional_step_scalar(chunk, "ego_yawrate", index),
+    }
+
+
+def make_can_bus(cur_pose: dict, prev_pose: dict | None) -> np.ndarray:
+    """Build VAD-style can_bus for direct transformer calls.
+
+    VAD's dataset/detector passes absolute ego pose into img_meta and then
+    converts translation and rotation to frame deltas before BEV temporal
+    fusion. This exporter bypasses that detector wrapper, so the delta fields
+    are computed here.
+    """
+
+    can_bus = np.zeros((18,), dtype=np.float32)
+    if prev_pose is not None:
+        can_bus[0] = float(cur_pose["x"] - prev_pose["x"])
+        can_bus[1] = float(cur_pose["y"] - prev_pose["y"])
+        can_bus[-1] = float(cur_pose["patch_angle"] - prev_pose["patch_angle"])
+
+    yaw = float(cur_pose["yaw"])
+    half_yaw = 0.5 * yaw
+    # Quaternion order matches pyquaternion/nuscenes: w, x, y, z.
+    can_bus[3:7] = np.asarray(
+        [np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)],
+        dtype=np.float32,
+    )
+    can_bus[12] = float(cur_pose["yawrate"])
+    can_bus[13] = float(cur_pose["speed"] * np.cos(yaw))
+    can_bus[14] = float(cur_pose["speed"] * np.sin(yaw))
+    can_bus[-2] = float(np.radians(cur_pose["patch_angle"]))
+    return can_bus
+
+
+def make_frame_img_meta(
+    base_meta: dict,
+    can_bus: np.ndarray,
+    path: Path,
+    index: int,
+    has_prev: bool,
+) -> dict:
+    meta = dict(base_meta)
+    meta["can_bus"] = can_bus
+    meta["scene_token"] = path.stem
+    meta["sample_idx"] = int(index)
+    meta["prev_idx"] = int(index - 1) if has_prev else ""
+    meta["next_idx"] = int(index + 1)
+    return meta
+
+
 def pool_tokens(tokens: np.ndarray, mode: str) -> np.ndarray:
     tokens = np.asarray(tokens, dtype=np.float32)
     if tokens.ndim == 3 and tokens.shape[0] == 1:
@@ -219,10 +316,18 @@ def export_chunk(path: Path, out_path: Path, torch, model, cfg, args: argparse.N
     length = len(chunk["action"]) if "action" in chunk else len(next(iter(chunk.values())))
     latents = []
     prev_bev = None
-    meta = make_img_meta(args, cfg)
+    prev_pose = None
+    base_meta = make_img_meta(args, cfg)
     components = latent_components_arg(args.latent_components)
     with torch.no_grad():
         for index in range(length):
+            if _is_sequence_start(chunk, index):
+                prev_bev = None
+                prev_pose = None
+
+            cur_pose = _ego_pose_from_chunk(chunk, index)
+            can_bus = make_can_bus(cur_pose, prev_pose)
+            meta = make_frame_img_meta(base_meta, can_bus, path, index, prev_pose is not None)
             images = select_camera_arrays(chunk, index)
             img_np = normalize_and_resize(images, args, cfg)
             img = torch.from_numpy(img_np[None]).to(args.device)
@@ -233,6 +338,7 @@ def export_chunk(path: Path, out_path: Path, torch, model, cfg, args: argparse.N
                 for name in components
             ]
             latents.append(np.concatenate(pooled, axis=0).astype(np.float32))
+            prev_pose = cur_pose
     chunk[args.output_key] = np.stack(latents, axis=0).astype(np.float32)
     save_npz(out_path, chunk)
 
