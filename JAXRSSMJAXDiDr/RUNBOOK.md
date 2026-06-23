@@ -53,6 +53,133 @@ neighbor_vehicles_local
 expert_waypoints8
 ```
 
+## Bench2Drive Offline Replay Path
+
+Bench2Drive data is best used as an offline replay source first. The converter
+reads extracted clip folders containing `anno/*.json.gz`, optional
+`camera/rgb_top_down`, and optional HD maps, then writes Dreamer row-format
+`.npz` chunks that the existing JAX RSSM and planner scripts can consume.
+
+```bash
+export B2D_ROOT=/path/to/extracted/Bench2Drive-mini
+export B2D_SPLIT=Bench2Drive/docs/bench2drive_mini_10.json
+export B2D_HDMAP_DIR=/path/to/Bench2Drive-Map
+export B2D_REPLAY_DIR=$RUN_ROOT/bench2drive_replay
+
+python -m JAXRSSMJAXDiDr.bench2drive.convert_dataset \
+  --b2d_root "$B2D_ROOT" \
+  --split_json "$B2D_SPLIT" \
+  --hdmap_dir "$B2D_HDMAP_DIR" \
+  --output_replay_dir "$B2D_REPLAY_DIR" \
+  --bev_mode topdown_rgb \
+  --bev_shape 128 128 \
+  --chunk_length 64
+
+export REPLAY_DIR="$B2D_REPLAY_DIR"
+```
+
+`--bev_mode topdown_rgb` uses Bench2Drive's debug `rgb_top_down` camera and is
+the quickest way to make the CNN path work. `--bev_mode privileged_renderer`
+renders a CarDreamer-style BEV from HD map polylines plus annotated actor boxes.
+`--bev_mode none` keeps only structured state/route/neighbor features.
+
+Bench2Drive action conversion follows the CarDreamer internal control convention:
+
+```text
+action = [3 * (throttle - brake), -steer]
+```
+
+The converter also writes:
+
+```text
+b2d_bev                         optional [T, H, W, 3] uint8
+ego_x / ego_y / ego_yaw
+ego_speed / ego_yawrate
+neighbor_vehicles_local
+neighbor_vehicles_world
+route_waypoints8
+global_path_ego / global_path_ego_mask
+expert_waypoints8               8 future ego-frame points, 0.5s spacing
+trajectory                      [T, 8, 3]
+```
+
+For RSSM training with BEV enabled, use the same CNN/MLP keys for training and
+latent export:
+
+```bash
+python -m JAXRSSMJAXDiDr.scripts.train_offline_rssm \
+  --task carla_roundabout \
+  --replay_dir "$REPLAY_DIR" \
+  --logdir "$RUN_ROOT/b2d_jax_rssm" \
+  --batch_length 64 \
+  --batch_size 16 \
+  --updates 100000 \
+  --structured_world_model \
+  --dreamerv3.encoder.cnn_keys b2d_bev \
+  --dreamerv3.decoder.cnn_keys b2d_bev \
+  --dreamerv3.encoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining" \
+  --dreamerv3.decoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining"
+
+python -m JAXRSSMJAXDiDr.scripts.export_rssm_latents \
+  --checkpoint "$RUN_ROOT/b2d_jax_rssm/checkpoint.ckpt" \
+  --replay_dir "$REPLAY_DIR" \
+  --output_dir "$RUN_ROOT/b2d_jax_latents" \
+  --task carla_roundabout \
+  --structured_world_model \
+  --dreamerv3.encoder.cnn_keys b2d_bev \
+  --dreamerv3.decoder.cnn_keys b2d_bev \
+  --dreamerv3.encoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining" \
+  --dreamerv3.decoder.mlp_keys "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|global_path_ego_mask|target_region|route_remaining"
+```
+
+Then keep the normal planner path:
+
+```bash
+python -m JAXRSSMJAXDiDr.scripts.export_planner_dataset \
+  --replay_dir "$REPLAY_DIR" \
+  --latent_dir "$RUN_ROOT/b2d_jax_latents" \
+  --output_dir "$RUN_ROOT/b2d_jax_planner_dataset"
+
+python -m JAXRSSMJAXDiDr.scripts.train_jax_planner_pretrain \
+  --dataset_dir "$RUN_ROOT/b2d_jax_planner_dataset" \
+  --anchor_path "$ANCHOR_PATH" \
+  --output_dir "$RUN_ROOT/b2d_jax_didr_planner" \
+  --epochs 200
+```
+
+For Bench2Drive closed-loop testing, create a JSON config for the leaderboard
+agent:
+
+```json
+{
+  "replay_dir": "/path/to/bench2drive_replay",
+  "rssm_checkpoint": "/path/to/b2d_jax_rssm/checkpoint.ckpt",
+  "planner_checkpoint": "/path/to/b2d_jax_didr_planner/best.pkl.gz",
+  "anchor_path": "/path/to/anchors.npy",
+  "bev_mode": "topdown_rgb",
+  "bev_shape": [128, 128],
+  "structured_world_model": true
+}
+```
+
+Debug one Bench2Drive route from `Bench2Drive/leaderboard`:
+
+```bash
+bash leaderboard/scripts/run_evaluation.sh \
+  2000 8000 1 \
+  leaderboard/data/bench2drive220.xml \
+  leaderboard/team_code/jaxrssm_b2d_agent.py \
+  /path/to/jaxrssm_b2d_agent.json \
+  results/jaxrssm_b2d_dev.json \
+  results/jaxrssm_b2d_debug \
+  jaxrssm 0
+```
+
+`topdown_rgb` and `privileged_renderer` are privileged BEV inputs. Use them for
+research, debugging, and ablations. For official SENSORS-comparable reporting,
+set `bev_mode` to `none`, retrain/export with `--dreamerv3.encoder.cnn_keys none`,
+or replace `b2d_bev` with a BEV derived only from allowed sensors.
+
 ## 1. Expert Replay
 
 If you already have prepared PolyPlanner expert replay in `$REPLAY_DIR`, skip

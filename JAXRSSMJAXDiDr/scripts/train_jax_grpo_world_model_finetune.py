@@ -29,6 +29,7 @@ from JAXRSSMJAXDiDr.models.jax_didr_planner import (
 from JAXRSSMJAXDiDr.scripts.train_jax_stable_online_finetune import (
     MixedReplaySampler,
     StableOnlineTrainer,
+    concatenate_mixed_replay_batches,
     load_npz,
     parse_args as stable_parse_args,
     planner_modes_logits,
@@ -169,8 +170,7 @@ class GRPOMixedReplaySampler:
             return self.online.sample(batch_size, rng)
         offline_batch = self.offline.sample(offline_count, rng)
         online_batch = self.online.sample(online_count, rng)
-        keys = sorted(set(offline_batch.keys()) & set(online_batch.keys()))
-        return {key: np.concatenate([offline_batch[key], online_batch[key]], axis=0) for key in keys}
+        return concatenate_mixed_replay_batches(offline_batch, online_batch)
 
 
 class GRPOWorldModelTrainer(StableOnlineTrainer):

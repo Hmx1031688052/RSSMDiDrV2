@@ -46,6 +46,7 @@ experiments/
 debug/
 tmp/
 temp/
+tmp_b2d*/
 
 # OS files
 .DS_Store
@@ -55,5 +56,7 @@ Thumbs.db
 .idea/
 # External reference code, not pushed to this repo
 DiffusionDriveV2/
-Bench2Drive/
+/Bench2Drive/
+!JAXRSSMJAXDiDr/bench2drive/
+!JAXRSSMJAXDiDr/bench2drive/*.py
 # JAXRSSMJAXDiDr/

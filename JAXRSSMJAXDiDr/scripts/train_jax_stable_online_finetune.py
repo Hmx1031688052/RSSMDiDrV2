@@ -243,6 +243,44 @@ class ReplaySequenceDataset:
         return row
 
 
+def _append_trailing_singletons(array: np.ndarray, ndim: int) -> np.ndarray:
+    array = np.asarray(array)
+    if array.ndim >= int(ndim):
+        return array
+    return array.reshape(array.shape + (1,) * (int(ndim) - array.ndim))
+
+
+def _align_mixed_replay_pair(key: str, offline: np.ndarray, online: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    offline = np.asarray(offline)
+    online = np.asarray(online)
+    if offline.shape[1:] == online.shape[1:]:
+        return offline, online
+
+    ndim = max(offline.ndim, online.ndim)
+    offline_expanded = _append_trailing_singletons(offline, ndim)
+    online_expanded = _append_trailing_singletons(online, ndim)
+    if offline_expanded.shape[1:] == online_expanded.shape[1:]:
+        return offline_expanded, online_expanded
+
+    raise ValueError(
+        f"Cannot mix replay key '{key}': offline shape {offline.shape}, "
+        f"online shape {online.shape}. Check that offline replay and online "
+        "replay were produced with the same observation schema."
+    )
+
+
+def concatenate_mixed_replay_batches(
+    offline_batch: Dict[str, np.ndarray],
+    online_batch: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    keys = sorted(set(offline_batch.keys()) & set(online_batch.keys()))
+    mixed = {}
+    for key in keys:
+        offline_value, online_value = _align_mixed_replay_pair(key, offline_batch[key], online_batch[key])
+        mixed[key] = np.concatenate([offline_value, online_value], axis=0)
+    return mixed
+
+
 class MixedReplaySampler:
     def __init__(
         self,
@@ -269,8 +307,7 @@ class MixedReplaySampler:
             return self.online.sample(batch_size, rng)
         a = self.offline.sample(offline_count, rng)
         b = self.online.sample(online_count, rng)
-        keys = sorted(set(a.keys()) & set(b.keys()))
-        return {key: np.concatenate([a[key], b[key]], axis=0) for key in keys}
+        return concatenate_mixed_replay_batches(a, b)
 
 
 def scalarize(metrics: Dict[str, object]) -> Dict[str, float]:
