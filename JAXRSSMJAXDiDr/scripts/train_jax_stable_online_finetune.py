@@ -114,6 +114,24 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--target_speed_max", type=float, default=8.0)
     parser.add_argument("--fallback_speed", type=float, default=1.5)
     parser.add_argument("--stop_speed", type=float, default=0.25)
+    parser.add_argument("--yield_safety_filter", dest="yield_safety_filter", action="store_true", default=True)
+    parser.add_argument("--no_yield_safety_filter", dest="yield_safety_filter", action="store_false")
+    parser.add_argument("--safety_lateral_width", type=float, default=2.2)
+    parser.add_argument("--safety_ttc", type=float, default=1.5)
+    parser.add_argument("--safety_distance_min", type=float, default=4.0)
+    parser.add_argument("--emergency_distance", type=float, default=2.0)
+    parser.add_argument(
+        "--yield_intervention_penalty_weight",
+        type=float,
+        default=1.0,
+        help="Penalty for imagined modes that need the yield safety filter to slow down. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--yield_emergency_penalty_weight",
+        type=float,
+        default=5.0,
+        help="Extra penalty for imagined modes that enter the emergency gap.",
+    )
     parser.add_argument("--speed_kp", type=float, default=1.0)
     parser.add_argument("--speed_ki", type=float, default=0.0)
     parser.add_argument("--speed_kd", type=float, default=0.0)
@@ -734,7 +752,40 @@ class StableOnlineTrainer:
                 cpa_risk = jnp.where(cpa_valid, jnp.square(distance_risk) * time_risk, 0.0)
                 return jnp.maximum(jnp.max(leading_risk, axis=1), jnp.max(cpa_risk, axis=1))
 
-            def eval_like_controller(rel_xy, ego_speed, last_steer, integral, prev_error, ready):
+            def yield_adjust_target_speed(target_speed, neighbor_flat, x, y, yaw, ego_speed, elapsed):
+                if not bool(self.args.yield_safety_filter) or int(self.neighbor_vehicle_dim) <= 0:
+                    return target_speed, jnp.zeros_like(target_speed), jnp.zeros_like(target_speed, dtype=bool)
+                neigh = neighbor_flat.reshape((neighbor_flat.shape[0], int(self.neighbor_vehicle_dim) // 11, 11))
+                valid = neigh[..., 0] > 0.5
+                nwx = neigh[..., 1] + neigh[..., 3] * elapsed
+                nwy = neigh[..., 2] + neigh[..., 4] * elapsed
+                dx = nwx - x[:, None]
+                dy = nwy - y[:, None]
+                cos_y = jnp.cos(yaw)[:, None]
+                sin_y = jnp.sin(yaw)[:, None]
+                rel_x = cos_y * dx + sin_y * dy
+                rel_y = -sin_y * dx + cos_y * dy
+                ahead = (
+                    valid
+                    & (rel_x > 0.0)
+                    & (rel_x <= float(self.args.ttc_max_distance))
+                    & (jnp.abs(rel_y) <= float(self.args.safety_lateral_width))
+                )
+                gap = jnp.min(jnp.where(ahead, rel_x, 1e6), axis=1)
+                safety_gap = float(self.args.safety_distance_min) + jnp.maximum(ego_speed, 0.0) * float(self.args.safety_ttc)
+                emergency = gap < float(self.args.emergency_distance)
+                active = gap < safety_gap
+                ratio = jnp.clip(
+                    (gap - float(self.args.emergency_distance))
+                    / jnp.maximum(safety_gap - float(self.args.emergency_distance), 1e-6),
+                    0.0,
+                    1.0,
+                )
+                adjusted = jnp.where(active, jnp.minimum(target_speed, target_speed * ratio), target_speed)
+                yield_cost = jnp.where(active, 1.0 - ratio, 0.0)
+                return adjusted, yield_cost, emergency
+
+            def eval_like_controller(rel_xy, ego_speed, last_steer, integral, prev_error, ready, neighbor_flat, x, y, yaw, elapsed):
                 finite = jnp.all(jnp.isfinite(rel_xy), axis=(1, 2))
                 lateral_ok = jnp.max(jnp.abs(rel_xy[..., 1]), axis=1) <= float(self.args.max_abs_y)
                 step_dist = jnp.linalg.norm(jnp.diff(rel_xy, axis=1), axis=-1)
@@ -777,6 +828,15 @@ class StableOnlineTrainer:
                     float(self.args.target_speed_max),
                 )
                 target_speed = jnp.where(valid, target_speed, 0.0)
+                target_speed, yield_cost, emergency = yield_adjust_target_speed(
+                    target_speed,
+                    neighbor_flat,
+                    x,
+                    y,
+                    yaw,
+                    ego_speed,
+                    elapsed,
+                )
 
                 forward_seg = jnp.linalg.norm(jnp.diff(forward_xy, axis=1), axis=-1)
                 seg_mask = seg_idx[None] < jnp.maximum(forward_count[:, None] - 1, 0)
@@ -838,7 +898,7 @@ class StableOnlineTrainer:
                     float(self.args.acc_min),
                     -1.0,
                 )
-                acc = jnp.where(valid, acc_valid, acc_invalid)
+                acc = jnp.where(emergency, float(self.args.acc_min), jnp.where(valid, acc_valid, acc_invalid))
                 next_integral = jnp.where(valid, next_integral_valid, integral)
                 next_prev_error = jnp.where(valid, error, prev_error)
                 next_ready = ready | valid
@@ -847,18 +907,23 @@ class StableOnlineTrainer:
                     1e-6,
                 ) - 1.0
                 action = jnp.stack([jnp.clip(acc_norm, -1.0, 1.0), steer], axis=-1)
-                return action, acc, steer, next_integral, next_prev_error, next_ready
+                return action, acc, steer, next_integral, next_prev_error, next_ready, yield_cost, emergency
 
             for step_idx in range(int(self.args.score_horizon_steps)):
                 rel_xy = to_current_ego(flat_modes, pose_x, pose_y, pose_yaw)
                 speed_vec = cur_speed.reshape((-1,))
-                action, acc, prev_steer, pid_integral, pid_prev_error, pid_ready = eval_like_controller(
+                action, acc, prev_steer, pid_integral, pid_prev_error, pid_ready, yield_cost, emergency = eval_like_controller(
                     rel_xy,
                     speed_vec,
                     prev_steer,
                     pid_integral,
                     pid_prev_error,
                     pid_ready,
+                    flat_neighbors,
+                    pose_x,
+                    pose_y,
+                    pose_yaw,
+                    float(step_idx) * float(self.args.dt),
                 )
                 cur_state = self.agent.agent.wm.rssm.img_step(cur_state, action)
                 reward = self.agent.agent.wm.heads["reward"](cur_state).mode().reshape((-1,))
@@ -872,6 +937,8 @@ class StableOnlineTrainer:
                     float(step_idx) * float(self.args.dt),
                 )
                 reward = reward - float(self.args.ttc_penalty_weight) * ttc_cost
+                reward = reward - float(self.args.yield_intervention_penalty_weight) * yield_cost
+                reward = reward - float(self.args.yield_emergency_penalty_weight) * emergency.astype(jnp.float32)
                 returns = returns + discounts * reward
                 discounts = discounts * float(self.args.discount) * cont
 
@@ -999,6 +1066,8 @@ class StableOnlineTrainer:
             cached_plan_age = 0
             episode_return = 0.0
             episode_steps = 0
+            safety_count = 0
+            emergency_count = 0
 
             for step_idx in range(int(self.args.max_steps)):
                 prev_latent, condition = self.encode_obs(obs, previous_action, prev_latent)
@@ -1020,13 +1089,24 @@ class StableOnlineTrainer:
 
                 if valid:
                     target_speed = closed_loop.estimate_speed(forward_xy, self.args)
+                    safety_active = False
+                    emergency = False
+                    if bool(self.args.yield_safety_filter):
+                        target_speed, safety_active, emergency = closed_loop.safety_adjust_speed(
+                            obs,
+                            current_speed,
+                            target_speed,
+                            self.args,
+                        )
                     steer, _ = closed_loop.multi_point_pure_pursuit(
                         forward_xy,
                         current_speed,
                         previous_steer,
                         self.args,
                     )
-                    acc = pid.step(target_speed, current_speed)
+                    acc = self.args.acc_min if emergency else pid.step(target_speed, current_speed)
+                    safety_count += int(safety_active)
+                    emergency_count += int(emergency)
                 else:
                     target_speed = 0.0
                     steer = float(np.clip(previous_steer, -0.2, 0.2))
@@ -1071,6 +1151,8 @@ class StableOnlineTrainer:
                 "steps": episode_steps,
                 "return": float(episode_return),
                 "path": str(path) if path else None,
+                "safety_events": int(safety_count),
+                "emergency_events": int(emergency_count),
             }
             for key in ("destination_reached", "is_success", "out_of_lane", "time_exceeded", "is_collision"):
                 if key in obs:

@@ -114,6 +114,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--safety_distance_min", type=float, default=4.0)
     parser.add_argument("--safety_lateral_width", type=float, default=2.2)
     parser.add_argument("--emergency_distance", type=float, default=2.0)
+    parser.add_argument("--safety_filter", dest="safety_filter", action="store_true", default=True)
+    parser.add_argument("--no_safety_filter", dest="safety_filter", action="store_false")
     parser.add_argument("--save_plots", action="store_true")
     parser.add_argument("--live_plot", action="store_true", help="Show a realtime ego-frame window with top planner modes.")
     parser.add_argument("--plot_modes", type=int, default=6, help="Number of top-scored planner modes to draw.")
@@ -870,18 +872,21 @@ def main() -> None:
 
                 if valid:
                     target_speed = estimate_speed(forward_xy, args)
-                    # target_speed, safety_active, emergency = safety_adjust_speed(obs, current_speed, target_speed, args)
+                    safety_active = False
+                    emergency = False
+                    if bool(args.safety_filter):
+                        target_speed, safety_active, emergency = safety_adjust_speed(obs, current_speed, target_speed, args)
                     steer, lookahead = multi_point_pure_pursuit(forward_xy, current_speed, previous_steer, args)
                     # if np.max(np.abs(forward_xy[:, 1])) > args.lateral_error_soft_stop:
                     #     target_speed = min(target_speed, args.fallback_speed)
                     #     safety_active = True
-                    # if emergency:
-                    #     acc = args.acc_min
-                    #     target_speed = 0.0
-                    # else:
-                    acc = pid.step(target_speed, current_speed)
-                    # safety_count += int(safety_active)
-                    # emergency_count += int(emergency)
+                    if emergency:
+                        acc = args.acc_min
+                        target_speed = 0.0
+                    else:
+                        acc = pid.step(target_speed, current_speed)
+                    safety_count += int(safety_active)
+                    emergency_count += int(emergency)
                 else:
                     invalid_count += 1
                     target_speed = 0.0

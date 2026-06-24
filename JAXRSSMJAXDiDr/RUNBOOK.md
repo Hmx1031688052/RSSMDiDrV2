@@ -611,7 +611,23 @@ python -m JAXRSSMJAXDiDr.scripts.train_jax_stable_online_finetune \
   --no_collect \
   --structured_world_model
 ```
-
+python -m JAXRSSMJAXDiDr.scripts.train_jax_grpo_world_model_finetune \
+  --offline_replay_dir "$REPLAY_DIR" \
+  --rssm_checkpoint "$JAX_RSSM_CKPT" \
+  --planner_checkpoint "$RUN_ROOT/jax_didr_stable_online/planner_selector_online.pkl.gz" \
+  --output_dir "$RUN_ROOT/jax_didr_grpo_online" \
+  --task carla_roundabout \
+  --outer_iterations 5 \
+  --collect_episodes 1 \
+  --max_steps 1000 \
+  --wm_updates 100 \
+  --grpo_updates 100 \
+  --batch_length 64 \
+  --batch_size 16 \
+  --offline_ratio 0.7 \
+  --grpo_groups 4 \
+  --grpo_step_num 10 \
+  --structured_world_model
 Expected outputs:
 
 ```text
@@ -648,6 +664,10 @@ Useful knobs:
 --planner_output_unit    keep "meters" for current JAX planner checkpoints
 --anchor_path            optional anchor override, shape [num_modes, num_poses, 2]
 --ttc_penalty_weight     set 0 to disable imagined TTC risk penalty
+--yield_safety_filter    enabled by default; restores front-vehicle yielding in collect and imagined scoring
+--no_yield_safety_filter disable the yield filter if it reintroduces over-conservative stopping
+--yield_intervention_penalty_weight  penalizes modes that need safety-filter slowdown; lower if too timid
+--yield_emergency_penalty_weight      penalizes modes inside the emergency gap; raise if collisions remain
 --save_every_outer       snapshot interval for planner_selector_online_outer_*.pkl.gz
 ```
 
