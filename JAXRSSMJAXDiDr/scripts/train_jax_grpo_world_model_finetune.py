@@ -1,9 +1,9 @@
 """World-model GRPO fine-tuning for JAX RSSM + JAX DiDr.
 
-This script keeps the stable online collect/RSSM-update loop and replaces the
-selector-only planner update with a DiffusionDriveV2-style diffusion log-prob
-GRPO update. The reward source is the frozen online RSSM target model rather
-than NAVSIM PDM.
+This script alternates online replay collection with RSSM/planner training.
+Planner training first applies a DiffusionDriveV2-style diffusion log-prob
+GRPO update to the trajectory body, then runs a small selector-only update.
+The reward source is the frozen online RSSM target model rather than NAVSIM PDM.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import optax
 
 from JAXRSSMJAXDiDr.models import save_checkpoint
 from JAXRSSMJAXDiDr.models.jax_didr_planner import (
-    freeze_plan_anchor_updates,
     recompute_diffusion_chain_logprob,
     sample_diffusion_chain_with_logprob,
 )
@@ -32,13 +31,35 @@ from JAXRSSMJAXDiDr.scripts.train_jax_stable_online_finetune import (
     load_npz,
     parse_args as stable_parse_args,
     planner_modes_logits,
+    poses_xy_meters,
+    replace_selector_params,
     replay_paths,
     scalarize,
 )
 
 
+GRPO_TRAJECTORY_BODY_KEYS = {
+    "anchor_encoder",
+    "time_encoder",
+    "latent_encoder",
+    "decoder_layers",
+    "delta_head",
+}
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     grpo_parser = argparse.ArgumentParser(add_help=False)
+    grpo_parser.add_argument(
+        "--online_schedule",
+        choices=("alternate_collect_train", "every_outer", "train_only"),
+        default="alternate_collect_train",
+    )
+    grpo_parser.add_argument(
+        "--grpo_trainable",
+        choices=("trajectory_body", "all_except_plan_anchor"),
+        default="trajectory_body",
+    )
+    grpo_parser.add_argument("--grpo_freeze_selector", action=argparse.BooleanOptionalAction, default=True)
     grpo_parser.add_argument("--grpo_updates", type=int, default=200)
     grpo_parser.add_argument("--grpo_lr", type=float, default=1e-5)
     grpo_parser.add_argument("--grpo_groups", type=int, default=4)
@@ -53,6 +74,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     grpo_parser.add_argument("--grpo_grad_clip", type=float, default=1.0)
     grpo_parser.add_argument("--grpo_min_logprob_std", type=float, default=0.1)
     grpo_parser.add_argument("--grpo_additive_noise", action="store_true")
+    grpo_parser.add_argument("--selector_after_grpo_updates", type=int, default=20)
+    grpo_parser.add_argument("--selector_after_grpo_lr", type=float, default=2e-6)
+    grpo_parser.add_argument("--selector_after_grpo_ranking_weight", type=float, default=1.0)
+    grpo_parser.add_argument("--selector_after_grpo_kl_weight", type=float, default=0.2)
+    grpo_parser.add_argument("--selector_after_grpo_entropy_weight", type=float, default=0.0)
     grpo_args, stable_argv = grpo_parser.parse_known_args()
 
     old_argv = sys.argv[:]
@@ -75,6 +101,27 @@ def _target_xy_from_array(value: np.ndarray) -> Optional[np.ndarray]:
     if value.ndim >= 2 and value.shape[-1] == 16:
         return value.reshape(value.shape[:-1] + (8, 2)).astype(np.float32)
     return None
+
+
+def _zero_tree(tree):
+    return jax.tree_util.tree_map(jnp.zeros_like, tree)
+
+
+def _filter_grpo_trainable_tree(tree, trainable: str, freeze_selector: bool):
+    if not isinstance(tree, dict):
+        return tree
+    filtered = dict(tree)
+    if trainable == "trajectory_body":
+        for key, value in list(filtered.items()):
+            if key not in GRPO_TRAJECTORY_BODY_KEYS:
+                filtered[key] = _zero_tree(value)
+        return filtered
+
+    if "plan_anchor" in filtered:
+        filtered["plan_anchor"] = _zero_tree(filtered["plan_anchor"])
+    if bool(freeze_selector) and "selector_head" in filtered:
+        filtered["selector_head"] = _zero_tree(filtered["selector_head"])
+    return filtered
 
 
 class GRPOReplaySequenceDataset:
@@ -193,10 +240,16 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
             optax.clip_by_global_norm(float(args.grpo_grad_clip)),
             optax.adamw(float(args.grpo_lr), weight_decay=float(args.selector_weight_decay)),
         )
+        self.selector_light_opt = optax.chain(
+            optax.clip_by_global_norm(float(args.grad_clip)),
+            optax.adamw(float(args.selector_after_grpo_lr), weight_decay=float(args.selector_weight_decay)),
+        )
         self.grpo_state = self.grpo_opt.init(self.planner_params)
+        self.selector_light_state = self.selector_light_opt.init(self.selector_params)
         self.grpo_rng = jax.random.PRNGKey(int(args.seed) + 1701)
         self._sample_chain = jax.jit(self._sample_chain_impl)
         self._grpo_step = jax.jit(self._grpo_step_impl)
+        self._selector_light_step = jax.jit(self._selector_light_step_impl)
 
     def make_sampler(self) -> MixedReplaySampler:
         return MixedReplaySampler(
@@ -291,31 +344,10 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
 
             gt_mask = reward_group > (target_rewards[:, None, None] - 1e-6)
             adv_with_gt = jnp.maximum(advantages, 0.0) * gt_mask.astype(advantages.dtype)
-            advantages = jnp.where(target_valid[:, None, None], adv_with_gt, advantages)
-            advantages = jnp.where(safety, advantages, float(args.grpo_unsafe_adv))
+            advantages = jnp.where(target_valid[:, None, None], adv_with_gt, 0.0)
+            advantages = jnp.where(target_valid[:, None, None] & safety, advantages, 0.0)
+            advantages = jnp.where(target_valid[:, None, None] & (~safety), float(args.grpo_unsafe_adv), advantages)
             advantages = jnp.clip(advantages, -float(args.adv_clip), float(args.adv_clip))
-
-            _, logits = planner_modes_logits(
-                current_params,
-                self.planner_config,
-                feat,
-                int(args.eval_timestep),
-            )
-            _, ref_logits = planner_modes_logits(
-                self.ref_planner_params,
-                self.planner_config,
-                feat,
-                int(args.eval_timestep),
-            )
-            mode_advantages = jax.lax.stop_gradient(advantages.max(axis=1))
-            temperature = max(float(args.policy_temperature), 1e-6)
-            logp = jax.nn.log_softmax(logits / temperature, axis=-1)
-            prob = jax.nn.softmax(logits / temperature, axis=-1)
-            ref_logp = jax.nn.log_softmax(jax.lax.stop_gradient(ref_logits) / temperature, axis=-1)
-            ref_prob = jax.nn.softmax(jax.lax.stop_gradient(ref_logits) / temperature, axis=-1)
-            selector_loss = -(mode_advantages * logp).sum(axis=-1).mean()
-            selector_kl = (ref_prob * (ref_logp - logp)).sum(axis=-1).mean()
-            selector_entropy = -(prob * logp).sum(axis=-1).mean()
 
             discounts = jnp.asarray(
                 [float(args.grpo_discount_base) ** (int(args.grpo_step_num) - idx - 1) for idx in range(int(args.grpo_step_num))],
@@ -340,13 +372,7 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
             )
             il_weight = il_weight * target_valid.astype(il_weight.dtype)
             il_loss = (il_per_batch * il_weight).mean()
-            loss = (
-                rl_loss
-                + il_loss
-                + float(args.ranking_weight) * selector_loss
-                + float(args.kl_weight) * selector_kl
-                - float(args.entropy_weight) * selector_entropy
-            )
+            loss = rl_loss + il_loss
 
             positive = advantages > 0.0
             positive_count = jnp.maximum(positive.sum(), 1)
@@ -359,9 +385,6 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
                 "grpo_loss": loss,
                 "rl_loss": rl_loss,
                 "il_loss": il_loss,
-                "selector_loss": selector_loss,
-                "selector_kl": selector_kl,
-                "selector_entropy": selector_entropy,
                 "reward_mean": reward_group.mean(),
                 "reward_positive_mean": reward_positive_mean,
                 "positive_ratio": positive.astype(jnp.float32).mean(),
@@ -374,8 +397,9 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
             return loss, metrics
 
         (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
+        grads = _filter_grpo_trainable_tree(grads, args.grpo_trainable, bool(args.grpo_freeze_selector))
         updates, opt_state = self.grpo_opt.update(grads, opt_state, params)
-        updates = freeze_plan_anchor_updates(updates)
+        updates = _filter_grpo_trainable_tree(updates, args.grpo_trainable, bool(args.grpo_freeze_selector))
         params = optax.apply_updates(params, updates)
         metrics = dict(metrics)
         metrics["grpo_loss"] = loss
@@ -421,12 +445,110 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
                 )
         return metrics_last
 
+    def _selector_light_step_impl(self, selector_params, opt_state, params, ref_params, feat, returns):
+        args = self.args
+
+        def objective(current_selector_params):
+            current_params = replace_selector_params(params, current_selector_params)
+            _, logits = planner_modes_logits(
+                current_params,
+                self.planner_config,
+                feat,
+                int(args.eval_timestep),
+            )
+            _, ref_logits = planner_modes_logits(
+                ref_params,
+                self.planner_config,
+                feat,
+                int(args.eval_timestep),
+            )
+            temperature = max(float(args.policy_temperature), 1e-6)
+            logp = jax.nn.log_softmax(logits / temperature, axis=-1)
+            prob = jax.nn.softmax(logits / temperature, axis=-1)
+            ref_logp = jax.nn.log_softmax(jax.lax.stop_gradient(ref_logits) / temperature, axis=-1)
+            ref_prob = jax.nn.softmax(jax.lax.stop_gradient(ref_logits) / temperature, axis=-1)
+
+            adv = returns - returns.mean(axis=-1, keepdims=True)
+            adv = adv / jnp.maximum(returns.std(axis=-1, keepdims=True), float(args.adv_eps))
+            adv = jnp.clip(adv, -float(args.adv_clip), float(args.adv_clip))
+            adv = jax.lax.stop_gradient(adv)
+            ranking_loss = -(adv * logp).sum(axis=-1).mean()
+            kl_loss = (ref_prob * (ref_logp - logp)).sum(axis=-1).mean()
+            entropy = -(prob * logp).sum(axis=-1).mean()
+            loss = (
+                float(args.selector_after_grpo_ranking_weight) * ranking_loss
+                + float(args.selector_after_grpo_kl_weight) * kl_loss
+                - float(args.selector_after_grpo_entropy_weight) * entropy
+            )
+            selected = jnp.argmax(logits, axis=-1)
+            oracle = jnp.argmax(returns, axis=-1)
+            batch_idx = jnp.arange(returns.shape[0])
+            metrics = {
+                "selector_loss": loss,
+                "ranking_loss": ranking_loss,
+                "kl_loss": kl_loss,
+                "entropy": entropy,
+                "return_mean": returns.mean(),
+                "return_std": returns.std(),
+                "selected_return": returns[batch_idx, selected].mean(),
+                "oracle_return": returns.max(axis=-1).mean(),
+                "rank_acc": (selected == oracle).astype(jnp.float32).mean(),
+            }
+            return loss, metrics
+
+        (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(selector_params)
+        updates, opt_state = self.selector_light_opt.update(grads, opt_state, selector_params)
+        selector_params = optax.apply_updates(selector_params, updates)
+        metrics = dict(metrics)
+        metrics["selector_loss"] = loss
+        return selector_params, opt_state, metrics
+
+    def update_selector_light(self, outer_idx: int) -> dict:
+        updates_total = int(self.args.selector_after_grpo_updates)
+        if updates_total <= 0:
+            return {"updates": 0}
+        sampler = self.make_sampler()
+        ref_params = jax.tree_util.tree_map(jax.lax.stop_gradient, self.planner_params)
+        metrics_last = {}
+        for update in range(1, updates_total + 1):
+            batch = sampler.sample(int(self.args.batch_size), self.rng_np)
+            batch = jax.tree_util.tree_map(lambda x: jax.device_put(x, self.device), batch)
+            state, speed, feat, neighbors = self.start_from_target(batch)
+            poses_reg, _ = planner_modes_logits(
+                self.planner_params,
+                self.planner_config,
+                feat,
+                int(self.args.eval_timestep),
+            )
+            modes_xy = jax.lax.stop_gradient(poses_xy_meters(poses_reg, self.args))
+            returns = jax.lax.stop_gradient(self.returns_from_target(state, speed, neighbors, modes_xy))
+            self.selector_params, self.selector_light_state, metrics = self._selector_light_step(
+                self.selector_params,
+                self.selector_light_state,
+                self.planner_params,
+                ref_params,
+                feat,
+                returns,
+            )
+            self.planner_params = replace_selector_params(self.planner_params, self.selector_params)
+            metrics_last = scalarize(metrics)
+            if update == 1 or update % int(self.args.log_every) == 0:
+                print(
+                    "[selector_light] "
+                    f"outer={outer_idx} update={update} "
+                    + " ".join(f"{k}={v:.5f}" for k, v in metrics_last.items()),
+                    flush=True,
+                )
+        metrics_last["updates"] = float(updates_total)
+        return metrics_last
+
     def save_planner(self, outer_idx: int) -> None:
+        opt_state = {"grpo": self.grpo_state, "selector_light": self.selector_light_state}
         save_checkpoint(
             self.output_dir / "planner_grpo_online.pkl.gz",
             self.planner_config,
             self.planner_params,
-            self.grpo_state,
+            opt_state,
             outer_idx,
         )
         if int(self.args.save_every_outer) > 0 and outer_idx % int(self.args.save_every_outer) == 0:
@@ -434,7 +556,7 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
                 self.output_dir / f"planner_grpo_online_outer_{outer_idx:04d}.pkl.gz",
                 self.planner_config,
                 self.planner_params,
-                self.grpo_state,
+                opt_state,
                 outer_idx,
             )
 
@@ -443,33 +565,55 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
             "args": vars(self.args),
             "extra": self.extra,
             "planner_checkpoint_epoch": self.planner_epoch,
-            "trainable": "planner_diffusion_body_except_plan_anchor",
-            "rssm_update": "online_world_model_mixed_offline_online_replay",
-            "planner_update": "diffusion_logprob_grpo_with_frozen_target_rssm_reward",
+            "online_schedule": self.args.online_schedule,
+            "trainable": self.args.grpo_trainable,
+            "rssm_update": "online_mixed_replay",
+            "planner_update": "diffusiondrivev2_style_grpo_then_light_selector",
         }
         (self.output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
 
         for outer in range(1, int(self.args.outer_iterations) + 1):
-            print(f"[grpo_online] outer={outer} collect", flush=True)
-            collect_metrics = self.collect(outer)
-            print(f"[grpo_online] outer={outer} update_rssm", flush=True)
-            wm_metrics = self.update_rssm(outer)
-            print(f"[grpo_online] outer={outer} update_grpo", flush=True)
-            grpo_metrics = self.update_grpo(outer)
-            self.save_planner(outer)
+            if self.args.online_schedule == "alternate_collect_train":
+                phase = "collect" if outer % 2 == 1 else "train"
+            elif self.args.online_schedule == "every_outer":
+                phase = "collect_train"
+            else:
+                phase = "train"
+
+            collect_metrics = {"episodes": 0, "steps": 0, "mean_return": 0.0}
+            wm_metrics = {}
+            grpo_metrics = {}
+            selector_metrics = {}
+
+            if phase in {"collect", "collect_train"}:
+                print(f"[grpo_online] outer={outer} phase={phase} collect", flush=True)
+                collect_metrics = self.collect(outer)
+
+            if phase in {"train", "collect_train"}:
+                print(f"[grpo_online] outer={outer} phase={phase} update_rssm", flush=True)
+                wm_metrics = self.update_rssm(outer)
+                print(f"[grpo_online] outer={outer} phase={phase} update_grpo", flush=True)
+                grpo_metrics = self.update_grpo(outer)
+                print(f"[grpo_online] outer={outer} phase={phase} update_selector_light", flush=True)
+                selector_metrics = self.update_selector_light(outer)
+                self.save_planner(outer)
+
             row = {
                 "outer": outer,
+                "phase": phase,
                 "collect": collect_metrics,
                 "wm": wm_metrics,
                 "grpo": grpo_metrics,
+                "selector_light": selector_metrics,
             }
             self.history.append(row)
             (self.output_dir / "history.json").write_text(json.dumps(self.history, indent=2), encoding="utf-8")
             print(
-                f"[grpo_online] outer={outer} "
+                f"[grpo_online] outer={outer} phase={phase} "
                 f"mean_return={collect_metrics.get('mean_return', 0.0):.3f} "
                 f"wm_loss={wm_metrics.get('stable_online_wm_loss', float('nan')):.6f} "
-                f"reward_mean={grpo_metrics.get('reward_mean', float('nan')):.5f}",
+                f"reward_mean={grpo_metrics.get('reward_mean', float('nan')):.5f} "
+                f"selector_rank_acc={selector_metrics.get('rank_acc', float('nan')):.5f}",
                 flush=True,
             )
 
