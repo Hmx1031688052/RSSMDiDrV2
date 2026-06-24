@@ -20,7 +20,6 @@ import numpy as np
 import optax
 
 from JAXRSSMJAXDiDr.models import save_checkpoint
-from JAXRSSMJAXDiDr.models.controller import apply_plan_sign
 from JAXRSSMJAXDiDr.models.jax_didr_planner import (
     freeze_plan_anchor_updates,
     recompute_diffusion_chain_logprob,
@@ -330,7 +329,8 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
             rl_loss_b = rl_loss_per_step.mean(axis=-1)
             rl_loss = rl_loss_b.mean()
 
-            signed_pred_xy = apply_plan_sign(pred_xy_steps, float(args.plan_x_sign), float(args.plan_y_sign))
+            pred_sign = jnp.asarray([float(args.plan_x_sign), float(args.plan_y_sign)], dtype=pred_xy_steps.dtype)
+            signed_pred_xy = pred_xy_steps * pred_sign.reshape((1, 1, 1, 1, 2, 1))
             il_per_batch = jnp.abs(signed_pred_xy - target_xy[:, None, None, :, :, None]).mean(axis=(1, 2, 3, 4, 5))
             has_positive = (advantages_steps > 0.0).any(axis=(1, 2, 3))
             il_weight = jnp.where(
