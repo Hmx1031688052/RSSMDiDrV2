@@ -38,7 +38,9 @@ datasets/
 carla_dataset/
 planner_dataset/
 jax_planner_dataset/
-
+anchors.npy
+closed_loop_steps.jsonl
+polyplanner_anchors_15.png
 # Outputs
 outputs/
 results/

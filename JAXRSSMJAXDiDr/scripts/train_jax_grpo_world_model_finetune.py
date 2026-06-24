@@ -132,10 +132,12 @@ class GRPOReplaySequenceDataset:
         replay_dirs: Iterable[str | Path],
         batch_length: int,
         allowed_keys: Optional[set[str]] = None,
+        allow_planner_waypoints_target: bool = True,
     ):
         self.replay_dirs = [Path(path) for path in replay_dirs if path is not None]
         self.batch_length = int(batch_length)
         self.allowed_keys = set(allowed_keys) if allowed_keys is not None else None
+        self.allow_planner_waypoints_target = bool(allow_planner_waypoints_target)
         self.paths: list[Path] = []
         self.lengths: list[int] = []
         for directory in self.replay_dirs:
@@ -174,12 +176,19 @@ class GRPOReplaySequenceDataset:
             if self.allowed_keys is not None and "executed_control" not in self.allowed_keys:
                 row.pop("executed_control", None)
 
-        for target_key in ("expert_waypoints8", "trajectory", "planner_waypoints8"):
+        target_keys = ["expert_waypoints8", "trajectory"]
+        if self.allow_planner_waypoints_target:
+            target_keys.append("planner_waypoints8")
+        for target_key in target_keys:
             if target_key in chunk and len(chunk[target_key]) >= end:
                 target_xy = _target_xy_from_array(np.asarray(chunk[target_key][start:end]))
                 if target_xy is not None:
                     row["grpo_target_xy"] = target_xy
                     break
+        row.setdefault(
+            "grpo_target_xy",
+            np.full((self.batch_length, 8, 2), np.nan, dtype=np.float32),
+        )
 
         row.setdefault("is_first", np.zeros((self.batch_length,), dtype=bool))
         row.setdefault("is_last", np.zeros((self.batch_length,), dtype=bool))
@@ -199,10 +208,20 @@ class GRPOMixedReplaySampler:
         allowed_keys: set[str],
         offline_ratio: float,
     ):
-        self.offline = GRPOReplaySequenceDataset([offline_dir], batch_length, allowed_keys)
+        self.offline = GRPOReplaySequenceDataset(
+            [offline_dir],
+            batch_length,
+            allowed_keys,
+            allow_planner_waypoints_target=True,
+        )
         self.online = None
         if replay_paths(online_dir):
-            self.online = GRPOReplaySequenceDataset([online_dir], batch_length, allowed_keys)
+            self.online = GRPOReplaySequenceDataset(
+                [online_dir],
+                batch_length,
+                allowed_keys,
+                allow_planner_waypoints_target=False,
+            )
         self.offline_ratio = float(np.clip(offline_ratio, 0.0, 1.0))
 
     def sample(self, batch_size: int, rng: np.random.Generator) -> Dict[str, np.ndarray]:

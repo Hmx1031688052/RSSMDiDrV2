@@ -1,8 +1,5 @@
 ﻿'''
-python -m JAXRSSMJAXDiDr.tools.checkanchors \
-  --anchor_path ${ANCHOR_PATH} \
-  --output ${RUN_ROOT}/polyplanner_anchors_20.png \
-  --show_counts
+python -m JAXRSSMJAXDiDr.tools.checkanchors --anchor_path "E:\carla_code\ForDebug/anchors.npy" --output polyplanner_anchors_15.png --show_counts
   '''
 from __future__ import annotations
 
