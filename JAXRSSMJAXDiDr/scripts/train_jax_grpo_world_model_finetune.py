@@ -340,6 +340,7 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
         args = self.args
 
         def objective(current_params):
+            safe_target_xy = jnp.where(target_valid[:, None, None], target_xy, 0.0)
             out = recompute_diffusion_chain_logprob(
                 current_params,
                 self.planner_config,
@@ -382,7 +383,7 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
 
             pred_sign = jnp.asarray([float(args.plan_x_sign), float(args.plan_y_sign)], dtype=pred_xy_steps.dtype)
             signed_pred_xy = pred_xy_steps * pred_sign.reshape((1, 1, 1, 1, 2, 1))
-            il_per_batch = jnp.abs(signed_pred_xy - target_xy[:, None, None, :, :, None]).mean(axis=(1, 2, 3, 4, 5))
+            il_per_batch = jnp.abs(signed_pred_xy - safe_target_xy[:, None, None, :, :, None]).mean(axis=(1, 2, 3, 4, 5))
             has_positive = (advantages_steps > 0.0).any(axis=(1, 2, 3))
             il_weight = jnp.where(
                 has_positive,
@@ -390,7 +391,8 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
                 float(args.grpo_il_weight_no_positive),
             )
             il_weight = il_weight * target_valid.astype(il_weight.dtype)
-            il_loss = (il_per_batch * il_weight).mean()
+            valid_count = jnp.maximum(target_valid.astype(il_weight.dtype).sum(), 1.0)
+            il_loss = (il_per_batch * il_weight).sum() / valid_count
             loss = rl_loss + il_loss
 
             positive = advantages > 0.0
@@ -417,11 +419,18 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
 
         (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
         grads = _filter_grpo_trainable_tree(grads, args.grpo_trainable, bool(args.grpo_freeze_selector))
+        grads_finite = jnp.stack(
+            [jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree_util.tree_leaves(grads)]
+        ).all()
+        finite_step = jnp.isfinite(loss) & grads_finite
+        grads = jax.tree_util.tree_map(lambda grad: jnp.where(finite_step, grad, jnp.zeros_like(grad)), grads)
         updates, opt_state = self.grpo_opt.update(grads, opt_state, params)
         updates = _filter_grpo_trainable_tree(updates, args.grpo_trainable, bool(args.grpo_freeze_selector))
+        updates = jax.tree_util.tree_map(lambda update: jnp.where(finite_step, update, jnp.zeros_like(update)), updates)
         params = optax.apply_updates(params, updates)
         metrics = dict(metrics)
         metrics["grpo_loss"] = loss
+        metrics["finite_step"] = finite_step.astype(jnp.float32)
         return params, opt_state, metrics
 
     def update_grpo(self, outer_idx: int) -> dict:
@@ -440,7 +449,8 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
             batch_size, groups, modes = final_xy.shape[:3]
             flat_xy = final_xy.reshape((batch_size, groups * modes, final_xy.shape[-2], 2))
             rewards = self.returns_from_target(state, speed, neighbors, flat_xy).reshape((batch_size, groups, modes))
-            target_rewards = self.returns_from_target(state, speed, neighbors, target_xy[:, None])[:, 0]
+            safe_target_xy = jnp.where(target_valid[:, None, None], target_xy, 0.0)
+            target_rewards = self.returns_from_target(state, speed, neighbors, safe_target_xy[:, None])[:, 0]
             safety_mask = self._trajectory_safety_mask(final_xy)
 
             self.planner_params, self.grpo_state, metrics = self._grpo_step(
@@ -516,10 +526,17 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
             return loss, metrics
 
         (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(selector_params)
+        grads_finite = jnp.stack(
+            [jnp.all(jnp.isfinite(leaf)) for leaf in jax.tree_util.tree_leaves(grads)]
+        ).all()
+        finite_step = jnp.isfinite(loss) & grads_finite
+        grads = jax.tree_util.tree_map(lambda grad: jnp.where(finite_step, grad, jnp.zeros_like(grad)), grads)
         updates, opt_state = self.selector_light_opt.update(grads, opt_state, selector_params)
+        updates = jax.tree_util.tree_map(lambda update: jnp.where(finite_step, update, jnp.zeros_like(update)), updates)
         selector_params = optax.apply_updates(selector_params, updates)
         metrics = dict(metrics)
         metrics["selector_loss"] = loss
+        metrics["finite_step"] = finite_step.astype(jnp.float32)
         return selector_params, opt_state, metrics
 
     def update_selector_light(self, outer_idx: int) -> dict:
