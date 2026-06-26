@@ -25,6 +25,7 @@ tensorboard/
 checkpoints/
 ckpt/
 *.pt
+*.npz
 *.pth
 *.pkl
 *.ckpt
