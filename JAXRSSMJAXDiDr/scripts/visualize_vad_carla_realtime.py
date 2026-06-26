@@ -44,6 +44,7 @@ def parse_args(argv=None):
     parser.add_argument("--map_score_thresh", type=float, default=0.35)
     parser.add_argument("--bev_size", type=int, default=640)
     parser.add_argument("--front_width", type=int, default=640)
+    parser.add_argument("--surround_width", type=int, default=960)
     parser.add_argument("--vad_every", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=0, help="0 means run until q/Esc.")
     parser.add_argument("--action_acc", type=float, default=0.0)
@@ -303,23 +304,64 @@ def render_bev(result, cfg, args):
     return canvas
 
 
-def render_front(obs, args):
+SURROUND_LAYOUT = (
+    ("camera_front_left", "FRONT LEFT"),
+    ("camera_front", "FRONT"),
+    ("camera_front_right", "FRONT RIGHT"),
+    ("camera_back_left", "BACK LEFT"),
+    ("camera_back", "BACK"),
+    ("camera_back_right", "BACK RIGHT"),
+)
+
+
+def _render_camera_tile(obs, key, label, tile_size):
     import cv2
 
+    if key not in obs:
+        raise KeyError(f"Observation is missing camera key: {key}")
+    tile_w, tile_h = tile_size
+    image = np.asarray(obs[key])
+    image = cv2.resize(image, (tile_w, tile_h))
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    cv2.rectangle(image, (0, 0), (tile_w, 24), (0, 0, 0), -1)
+    cv2.putText(
+        image,
+        label,
+        (8, 17),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    return image
+
+
+def render_surround(obs, args):
+    import cv2
+
+    panel_w = max(3, int(getattr(args, "surround_width", 0) or args.front_width))
+    tile_w = max(1, panel_w // 3)
     front = np.asarray(obs["camera_front"])
     h, w = front.shape[:2]
-    target_w = int(args.front_width)
-    target_h = max(1, int(h * target_w / max(w, 1)))
-    front = cv2.resize(front, (target_w, target_h))
-    return cv2.cvtColor(front, cv2.COLOR_RGB2BGR)
+    tile_h = max(1, int(h * tile_w / max(w, 1)))
+    tiles = [
+        _render_camera_tile(obs, key, label, (tile_w, tile_h))
+        for key, label in SURROUND_LAYOUT
+    ]
+    top = np.concatenate(tiles[:3], axis=1)
+    bottom = np.concatenate(tiles[3:], axis=1)
+    return np.concatenate([top, bottom], axis=0)
 
 
-def make_visual(front, bev):
+def make_visual(surround, bev):
     import cv2
 
-    if front.shape[0] != bev.shape[0]:
-        front = cv2.resize(front, (front.shape[1], bev.shape[0]))
-    return np.concatenate([front, bev], axis=1)
+    if bev.shape[0] != surround.shape[0]:
+        target_h = surround.shape[0]
+        target_w = max(1, int(bev.shape[1] * target_h / max(bev.shape[0], 1)))
+        bev = cv2.resize(bev, (target_w, target_h))
+    return np.concatenate([surround, bev], axis=1)
 
 
 def make_env_action(env, args):
@@ -440,9 +482,9 @@ def main(argv=None):
                         "and whether this model requires extra planning inputs."
                     ) from exc
 
-            front = render_front(obs, args)
+            surround = render_surround(obs, args)
             bev = render_bev(latest_result, cfg, args)
-            cv2.imshow(args.window, make_visual(front, bev))
+            cv2.imshow(args.window, make_visual(surround, bev))
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
