@@ -145,6 +145,11 @@ def make_space(array: np.ndarray, *, low=None, high=None):
             return embodied.Space(dtype=dtype, shape=shape, low=low, high=high)
 
 
+def _skip_replay_field(key: str, value: np.ndarray) -> bool:
+    value = np.asarray(value)
+    return key.startswith("__") or key.endswith("_path") or value.dtype.kind in ("O", "S", "U")
+
+
 def infer_spaces_from_replay(replay_dir: str | Path):
     """Infer Dreamer obs/action spaces from row-format replay chunks."""
 
@@ -163,7 +168,7 @@ def infer_spaces_from_replay(replay_dir: str | Path):
         obs_space = {}
         for key, value in chunk.items():
             value = np.asarray(value)
-            if key == "action" or value.ndim == 0 or value.shape[0] != length:
+            if key == "action" or _skip_replay_field(key, value) or value.ndim == 0 or value.shape[0] != length:
                 continue
             obs_space[key] = make_space(value)
         obs_space.setdefault("reward", make_space(np.zeros((length,), dtype=np.float32)))

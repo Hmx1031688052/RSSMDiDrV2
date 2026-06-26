@@ -1,3 +1,4 @@
+import concurrent.futures
 import datetime
 import math
 import pathlib
@@ -52,6 +53,16 @@ TRAJ_TOPIC = "/traj_best_vis"
 SUR_RADIUS_M = 60.0
 SUR_MAX_N = 30
 SEND_SIZE_IN_CM = True
+
+VAD_CAMERA_KEYS = (
+    "camera_front",
+    "camera_front_right",
+    "camera_front_left",
+    "camera_back",
+    "camera_back_left",
+    "camera_back_right",
+)
+SIDECAR_PATH_BYTES = 256
 
 
 def get_speed_mps(v: carla.Vector3D) -> float:
@@ -653,6 +664,76 @@ def _ensure_bool_vector(value):
     if value.shape == ():
         value = value.reshape(1)
     return value
+
+def _encode_sidecar_path(path):
+    raw = str(path).replace("\\", "/").encode("utf-8")
+    if len(raw) >= SIDECAR_PATH_BYTES:
+        raise ValueError(
+            f"Sidecar image path is too long for {SIDECAR_PATH_BYTES} bytes: {path}"
+        )
+    encoded = np.zeros((SIDECAR_PATH_BYTES,), dtype=np.uint8)
+    encoded[: len(raw)] = np.frombuffer(raw, dtype=np.uint8)
+    return encoded
+
+def _prepare_rgb_image(image, key):
+    image = np.asarray(image)
+    if image.ndim != 3 or image.shape[-1] < 3:
+        raise ValueError(f"Expected RGB image for {key!r}, got shape={image.shape}")
+    image = image[..., :3]
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(image)
+
+def _write_sidecar_jpeg(image, path, quality):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    quality = int(np.clip(int(quality), 1, 100))
+    try:
+        from PIL import Image
+
+        Image.fromarray(image, mode="RGB").save(
+            path,
+            format="JPEG",
+            quality=quality,
+            optimize=False,
+        )
+        return
+    except ModuleNotFoundError:
+        pass
+
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("Saving replay image sidecars requires Pillow or OpenCV.") from exc
+    ok = cv2.imwrite(str(path), image[..., ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise OSError(f"Failed to write sidecar image: {path}")
+
+def _schedule_sidecar_cameras(step_data, replay_dir, episode_index, timestep, quality, executor):
+    replay_dir = pathlib.Path(str(replay_dir))
+    futures = []
+    missing = [key for key in VAD_CAMERA_KEYS if key not in step_data]
+    if missing:
+        raise KeyError(
+            "Image sidecar replay expects all VAD camera keys every step; "
+            f"missing={missing}. Disable sidecars if this is not a VAD six-camera run."
+        )
+    for key in VAD_CAMERA_KEYS:
+        image = _prepare_rgb_image(step_data.pop(key), key)
+        relpath = pathlib.Path("samples") / f"episode_{int(episode_index):06d}" / key / f"{int(timestep):06d}.jpg"
+        step_data[f"{key}_path"] = _encode_sidecar_path(relpath.as_posix())
+        futures.append(executor.submit(_write_sidecar_jpeg, image, replay_dir / relpath, quality))
+    return futures
+
+def _drain_sidecar_futures(futures, keep_pending=0):
+    while len(futures) > int(keep_pending):
+        futures.pop(0).result()
+
+def _wait_sidecar_futures(futures):
+    for future in concurrent.futures.as_completed(list(futures)):
+        future.result()
+    futures.clear()
+
 def main(argv=None):
     yaml_path = pathlib.Path(__file__).resolve().with_name("dreamerv3.yaml")
     model_configs = yaml.YAML(typ="safe").load(
@@ -728,35 +809,104 @@ def main(argv=None):
 
         success = _is_success_episode(ep, ep_info)
         episode_return = float(np.asarray(ep["reward"]).sum())
+        episode_len = _episode_length(ep)
+
+        print(
+            f"[ROS2 Expert Collect] episode={episodes_done['count']} ended "
+            f"success={success} steps={episode_len} return={episode_return:.3f}",
+            flush=True,
+        )
 
         if success:
             defaults = _replay_step_defaults()
+            use_sidecars = bool(getattr(cfg, "replay_image_sidecars", False))
+            sidecar_quality = int(getattr(cfg, "replay_image_sidecar_quality", 90))
+            sidecar_workers = max(1, int(getattr(cfg, "replay_image_sidecar_workers", 4)))
+            sidecar_executor = None
+            sidecar_futures = []
+            sidecar_episode = episodes_done["count"]
 
-            for t in range(_episode_length(ep)):
-                step_data = _episode_step(ep, t)
+            print(
+                f"[ROS2 Expert Collect] writing successful episode to replay "
+                f"({episode_len} steps, image_sidecars={use_sidecars})...",
+                flush=True,
+            )
 
-                if "is_first" in step_data:
-                    step_data["episode_start"] = np.array(step_data["is_first"], copy=True)
-                    step_data["reset_export"] = np.array(step_data["is_first"], copy=True)
+            try:
+                if use_sidecars:
+                    sidecar_executor = concurrent.futures.ThreadPoolExecutor(max_workers=sidecar_workers)
 
-                # ep contains the reset transition; ep_info starts at env steps.
-                info_t = t - 1
-                for key, default in defaults.items():
-                    value = None
-                    if info_t >= 0:
-                        value = _pick_timestep_value(ep_info, key, info_t)
+                for t in range(episode_len):
+                    step_data = _episode_step(ep, t)
+
+                    if use_sidecars:
+                        sidecar_futures.extend(
+                            _schedule_sidecar_cameras(
+                                step_data,
+                                replay_dir,
+                                sidecar_episode,
+                                t,
+                                sidecar_quality,
+                                sidecar_executor,
+                            )
+                        )
+                        _drain_sidecar_futures(sidecar_futures, keep_pending=sidecar_workers * 4)
+
+                    if "is_first" in step_data:
+                        step_data["episode_start"] = np.array(step_data["is_first"], copy=True)
+                        step_data["reset_export"] = np.array(step_data["is_first"], copy=True)
+
+                    # ep contains the reset transition; ep_info starts at env steps.
+                    info_t = t - 1
+                    for key, default in defaults.items():
+                        value = None
+                        if info_t >= 0:
+                            value = _pick_timestep_value(ep_info, key, info_t)
+                            if value is None:
+                                value = _pick_timestep_value(ep, key, info_t)
+
                         if value is None:
-                            value = _pick_timestep_value(ep, key, info_t)
+                            value = np.array(default, copy=True)
 
-                    if value is None:
-                        value = np.array(default, copy=True)
+                        step_data[key] = _ensure_bool_vector(value)
 
-                    step_data[key] = _ensure_bool_vector(value)
+                    replay.add(step_data, 0)
+                    saved_steps["count"] += 1
+                    if (t + 1) % 25 == 0 or (t + 1) == episode_len:
+                        _drain_sidecar_futures(sidecar_futures, keep_pending=sidecar_workers * 2)
+                        print(
+                            f"[ROS2 Expert Collect] replay write progress "
+                            f"{t + 1}/{episode_len}",
+                            flush=True,
+                        )
+            finally:
+                if sidecar_executor is not None:
+                    if sidecar_futures:
+                        print(
+                            f"[ROS2 Expert Collect] waiting for "
+                            f"{len(sidecar_futures)} image sidecar writes...",
+                            flush=True,
+                        )
+                    try:
+                        _wait_sidecar_futures(sidecar_futures)
+                    finally:
+                        sidecar_executor.shutdown(wait=True)
 
-                replay.add(step_data, 0)
-                saved_steps["count"] += 1
+            if use_sidecars:
+                print(
+                    f"[ROS2 Expert Collect] image sidecars saved under "
+                    f"{pathlib.Path(str(replay_dir)) / 'samples'}",
+                    flush=True,
+                )
 
             saved_episodes["count"] += 1
+
+        else:
+            if episode_len:
+                print(
+                    "[ROS2 Expert Collect] episode skipped; only successful episodes are saved.",
+                    flush=True,
+                )
 
         last_env_action = policy.last_env_actions[0]
         logger.add(

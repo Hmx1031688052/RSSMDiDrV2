@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from JAXRSSMJAXDiDr.vad_carla.camera_setup import (
+    VAD_CAMERA_KEYS,
     VAD_CAMERA_ORDER,
     iter_camera_specs,
     lidar2img_matrix,
@@ -55,12 +56,22 @@ def parse_args() -> argparse.Namespace:
 
 def load_npz(path: Path) -> Dict[str, np.ndarray]:
     with np.load(path, allow_pickle=True) as data:
-        return {key: np.asarray(data[key]) for key in data.files}
+        chunk = {key: np.asarray(data[key]) for key in data.files}
+    chunk["__chunk_path__"] = np.asarray(str(path))
+    chunk["__replay_dir__"] = np.asarray(str(path.parent))
+    return chunk
 
 
 def save_npz(path: Path, arrays: Dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, **arrays)
+    drop_keys = set(VAD_CAMERA_KEYS)
+    drop_keys.update(f"{key}_path" for key in VAD_CAMERA_KEYS)
+    compact = {
+        key: value
+        for key, value in arrays.items()
+        if key not in drop_keys and not key.startswith("__")
+    }
+    np.savez_compressed(path, **compact)
 
 
 def import_vad_runtime(vad_root: Path):

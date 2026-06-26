@@ -28,6 +28,7 @@ from JAXRSSMJAXDiDr.scripts.train_jax_stable_online_finetune import (
     MixedReplaySampler,
     StableOnlineTrainer,
     concatenate_mixed_replay_batches,
+    _skip_sidecar_field,
     load_npz,
     parse_args as stable_parse_args,
     planner_modes_logits,
@@ -167,7 +168,11 @@ class GRPOReplaySequenceDataset:
         start = index - prev
         end = start + self.batch_length
         chunk = load_npz(self.paths[chunk_idx])
-        keys = [key for key, value in chunk.items() if np.asarray(value).ndim > 0 and len(value) >= end]
+        keys = [
+            key
+            for key, value in chunk.items()
+            if not _skip_sidecar_field(key) and np.asarray(value).ndim > 0 and len(value) >= end
+        ]
         if self.allowed_keys is not None:
             keys = [key for key in keys if key in self.allowed_keys or key == "executed_control"]
         row = {key: np.asarray(chunk[key][start:end]) for key in keys}

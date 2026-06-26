@@ -46,6 +46,8 @@ def load_replay_chunk(path: str | Path, trim_to_length: bool = True) -> Dict[str
     path = Path(path)
     with np.load(path, allow_pickle=True) as data:
         chunk = {key: np.asarray(data[key]) for key in data.files}
+    chunk["__chunk_path__"] = np.asarray(str(path))
+    chunk["__replay_dir__"] = np.asarray(str(path.parent))
 
     if trim_to_length:
         fallback = _first_sequence_length(chunk)

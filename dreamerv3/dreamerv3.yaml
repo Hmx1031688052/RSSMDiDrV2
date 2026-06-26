@@ -8,6 +8,9 @@ defaults:
   replay_size: 1e6
   replay_chunks: 1024
   replay_disk_buffer: False
+  replay_image_sidecars: False
+  replay_image_sidecar_quality: 90
+  replay_image_sidecar_workers: 4
   replay_queue_size: 8
   replay_online: False
   eval_dir: ""

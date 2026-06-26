@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 from typing import Dict, Iterable, Mapping
 
 import numpy as np
@@ -50,6 +51,7 @@ VAD_CAMERA_SPECS = {
 }
 
 VAD_CAMERA_KEYS = tuple(VAD_CAMERA_SPECS[name].key for name in VAD_CAMERA_ORDER)
+SIDECAR_PATH_BYTES = 256
 
 
 def build_vad_observation_overlay(
@@ -217,16 +219,75 @@ def iter_camera_specs(order: Iterable[str] = VAD_CAMERA_ORDER) -> Iterable[VADCa
         yield VAD_CAMERA_SPECS[name]
 
 
+def _decode_path_value(value) -> str:
+    value = np.asarray(value)
+    if value.dtype == np.uint8:
+        flat = value.reshape(-1)
+        zeros = np.flatnonzero(flat == 0)
+        end = int(zeros[0]) if zeros.size else int(flat.size)
+        return bytes(flat[:end].tolist()).decode("utf-8")
+    if value.shape == ():
+        item = value.item()
+    else:
+        item = value.reshape(-1)[0]
+    if isinstance(item, bytes):
+        return item.decode("utf-8")
+    return str(item)
+
+
+def _chunk_replay_dir(chunk: Mapping[str, np.ndarray]) -> Path:
+    for key in ("__replay_dir__", "_replay_dir"):
+        if key in chunk:
+            return Path(_decode_path_value(chunk[key]))
+    for key in ("__chunk_path__", "_chunk_path"):
+        if key in chunk:
+            return Path(_decode_path_value(chunk[key])).parent
+    return Path(".")
+
+
+def _load_rgb_sidecar(path: Path) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(f"Replay sidecar image does not exist: {path}")
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    except ModuleNotFoundError:
+        pass
+
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("Loading replay image sidecars requires Pillow or OpenCV.") from exc
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise OSError(f"Failed to read sidecar image: {path}")
+    return image[..., ::-1].astype(np.uint8)
+
+
+def _select_camera_image(chunk: Mapping[str, np.ndarray], key: str, index: int) -> np.ndarray:
+    if key in chunk:
+        return np.asarray(chunk[key][index])
+    path_key = f"{key}_path"
+    if path_key not in chunk:
+        raise KeyError(f"Replay chunk is missing VAD camera key `{key}` and sidecar key `{path_key}`")
+    paths = np.asarray(chunk[path_key])
+    value = paths if paths.ndim == 1 and paths.dtype == np.uint8 else paths[index]
+    relpath = Path(_decode_path_value(value))
+    if not relpath.is_absolute():
+        relpath = _chunk_replay_dir(chunk) / relpath
+    return _load_rgb_sidecar(relpath)
+
+
 def select_camera_arrays(chunk: Mapping[str, np.ndarray], index: int) -> np.ndarray:
-    """Stack RGB camera images in VAD camera order as [6, H, W, 3]."""
+    """Stack RGB camera images in VAD camera order as [6, H, W, 3].
+
+    Supports both legacy inline RGB arrays and nuScenes-style JPEG sidecars
+    referenced by `<camera_key>_path` uint8 path-byte fields.
+    """
 
     images = []
-    missing = []
     for key in VAD_CAMERA_KEYS:
-        if key not in chunk:
-            missing.append(key)
-            continue
-        images.append(np.asarray(chunk[key][index]))
-    if missing:
-        raise KeyError(f"Replay chunk is missing VAD camera keys: {missing}")
+        images.append(_select_camera_image(chunk, key, index))
     return np.stack(images, axis=0)

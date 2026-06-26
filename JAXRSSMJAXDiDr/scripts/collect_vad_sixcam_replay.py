@@ -51,6 +51,8 @@ def parse_args(argv=None):
     parser.add_argument("--vad_replay_size", type=int, default=1)
     parser.add_argument("--vad_batch_length", type=int, default=1)
     parser.add_argument("--vad_no_disk_replay_buffer", action="store_true")
+    parser.add_argument("--vad_inline_images", action="store_true")
+    parser.add_argument("--vad_jpeg_quality", type=int, default=90)
     parser.add_argument("--vad_no_birdeye", action="store_true")
     args, rest = parser.parse_known_args(argv)
     return args, rest
@@ -91,6 +93,10 @@ def main(argv=None) -> None:
         rest = ["--dreamerv3.batch_length", str(args.vad_batch_length), *rest]
     if not _has_flag(rest, "dreamerv3.replay_disk_buffer"):
         rest = ["--dreamerv3.replay_disk_buffer", str(not args.vad_no_disk_replay_buffer), *rest]
+    if not _has_flag(rest, "dreamerv3.replay_image_sidecars"):
+        rest = ["--dreamerv3.replay_image_sidecars", str(not args.vad_inline_images), *rest]
+    if not _has_flag(rest, "dreamerv3.replay_image_sidecar_quality"):
+        rest = ["--dreamerv3.replay_image_sidecar_quality", str(args.vad_jpeg_quality), *rest]
 
     collect_polyplanner = load_collect_polyplanner()
 
@@ -106,6 +112,11 @@ def main(argv=None) -> None:
         f"replay_size={_flag_value(rest, 'dreamerv3.replay_size', args.vad_replay_size)} "
         f"batch_length={_flag_value(rest, 'dreamerv3.batch_length', args.vad_batch_length)} "
         f"disk_buffer={_flag_value(rest, 'dreamerv3.replay_disk_buffer', not args.vad_no_disk_replay_buffer)}"
+    )
+    print(
+        "[vad_collect] image storage="
+        f"sidecars={_flag_value(rest, 'dreamerv3.replay_image_sidecars', not args.vad_inline_images)} "
+        f"jpeg_quality={_flag_value(rest, 'dreamerv3.replay_image_sidecar_quality', args.vad_jpeg_quality)}"
     )
     collect_polyplanner.main(rest)
 

@@ -198,6 +198,10 @@ def load_npz(path: str | Path) -> Dict[str, np.ndarray]:
         return {key: np.asarray(data[key]) for key in data.files}
 
 
+def _skip_sidecar_field(key: str) -> bool:
+    return key.startswith("__") or key.endswith("_path")
+
+
 def replay_paths(directory: str | Path) -> list[Path]:
     directory = Path(directory)
     return sorted(directory.glob("*.npz")) if directory.exists() else []
@@ -244,7 +248,11 @@ class ReplaySequenceDataset:
         start = index - prev
         end = start + self.batch_length
         chunk = load_npz(self.paths[chunk_idx])
-        keys = [key for key, value in chunk.items() if np.asarray(value).ndim > 0 and len(value) >= end]
+        keys = [
+            key
+            for key, value in chunk.items()
+            if not _skip_sidecar_field(key) and np.asarray(value).ndim > 0 and len(value) >= end
+        ]
         if self.allowed_keys is not None:
             keys = [key for key in keys if key in self.allowed_keys or key == "executed_control"]
         row = {key: np.asarray(chunk[key][start:end]) for key in keys}
