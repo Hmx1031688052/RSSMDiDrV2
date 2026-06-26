@@ -9,6 +9,7 @@ class Uniform(generic.Generic):
         directory=None,
         online=False,
         chunks=1024,
+        disk_buffer=False,
         min_size=1,
         samples_per_insert=None,
         tolerance=1e4,
@@ -28,4 +29,5 @@ class Uniform(generic.Generic):
             directory=directory,
             online=online,
             chunks=chunks,
+            disk_buffer=disk_buffer,
         )

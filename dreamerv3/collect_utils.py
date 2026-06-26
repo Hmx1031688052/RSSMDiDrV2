@@ -36,4 +36,12 @@ def make_replay(config, logdir):
     replay_dir_value = getattr(config, "replay_dir", None)
     replay_dir = embodied.Path(replay_dir_value or (logdir / "replay"))
     replay_dir.mkdirs()
-    return embodied.replay.Uniform(config.batch_length, config.replay_size, replay_dir), replay_dir
+    replay_chunks = int(getattr(config, "replay_chunks", 1024))
+    replay_disk_buffer = bool(getattr(config, "replay_disk_buffer", False))
+    return embodied.replay.Uniform(
+        config.batch_length,
+        config.replay_size,
+        replay_dir,
+        chunks=replay_chunks,
+        disk_buffer=replay_disk_buffer,
+    ), replay_dir

@@ -594,13 +594,6 @@ class Ros2ExpertCollectorPolicy:
         return np.clip(policy_action, -1.0, 1.0)
 
 
-def _copy_tran(tran):
-    out = {}
-    for k, v in tran.items():
-        out[k] = np.array(v, copy=True)
-    return out
-
-
 def _last_bool_from_source(src, key):
     if key not in src:
         return None
@@ -631,6 +624,21 @@ def _pick_timestep_value(src, key, t):
         return None
 
     return np.array(arr[t], copy=True)
+
+def _episode_length(ep):
+    for value in ep.values():
+        arr = np.asarray(value)
+        if arr.ndim > 0:
+            return int(arr.shape[0])
+    return 0
+
+def _episode_step(ep, t):
+    step = {}
+    for key, value in ep.items():
+        arr = np.asarray(value)
+        if arr.ndim > 0 and arr.shape[0] > t:
+            step[key] = np.array(arr[t], copy=True)
+    return step
 
 def _replay_step_defaults():
     return {
@@ -709,12 +717,8 @@ def main(argv=None):
     saved_episodes = {"count": 0}
     target_episodes = int(config.env.expert_collection.episodes)
 
-    # 关键修改：逐步缓存，episode 结束后再决定是否写 replay
-    episode_cache = []
-
     def on_step(tran, _, worker):
-        del worker
-        episode_cache.append(_copy_tran(tran))
+        del tran, worker
         step.increment()
 
     def on_episode(ep, ep_info, worker):
@@ -727,14 +731,14 @@ def main(argv=None):
         if success:
             defaults = _replay_step_defaults()
 
-            for t, tran in enumerate(episode_cache):
-                step_data = dict(tran)
+            for t in range(_episode_length(ep)):
+                step_data = _episode_step(ep, t)
 
                 if "is_first" in step_data:
                     step_data["episode_start"] = np.array(step_data["is_first"], copy=True)
                     step_data["reset_export"] = np.array(step_data["is_first"], copy=True)
 
-                # episode_cache 包含 reset transition；ep / ep_info 不包含
+                # ep contains the reset transition; ep_info starts at env steps.
                 info_t = t - 1
                 for key, default in defaults.items():
                     value = None
@@ -752,8 +756,6 @@ def main(argv=None):
                 replay.add(step_data, 0)
 
             saved_episodes["count"] += 1
-
-        episode_cache.clear()
 
         last_env_action = policy.last_env_actions[0]
         logger.add(

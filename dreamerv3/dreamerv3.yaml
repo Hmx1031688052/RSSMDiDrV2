@@ -6,6 +6,8 @@ defaults:
   replay: uniform
   # Use smalelr replay t osave memory; 1e5 can be suffcient for most tasks
   replay_size: 1e6
+  replay_chunks: 1024
+  replay_disk_buffer: False
   replay_online: False
   eval_dir: ""
   filter: ".*"

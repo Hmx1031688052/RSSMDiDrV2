@@ -20,6 +20,7 @@ class Generic:
         overlap=None,
         online=False,
         chunks=1024,
+        disk_buffer=False,
     ):
         assert capacity is None or 1 <= capacity
         self.length = length
@@ -36,7 +37,7 @@ class Generic:
             self.online_queue = deque()
             self.online_stride = length
             self.online_counters = defaultdict(int)
-        self.saver = directory and saver.Saver(directory, chunks)
+        self.saver = directory and saver.Saver(directory, chunks, disk_buffer=disk_buffer)
         self.metrics = {
             "samples": 0,
             "sample_wait_dur": 0,

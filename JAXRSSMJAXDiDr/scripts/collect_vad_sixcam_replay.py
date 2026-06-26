@@ -47,9 +47,28 @@ def parse_args(argv=None):
     parser.add_argument("--vad_camera_height", type=int, default=900)
     parser.add_argument("--vad_camera_fov", type=float, default=70.0)
     parser.add_argument("--vad_sensor_tick", type=float, default=0.1)
+    parser.add_argument("--vad_replay_chunks", type=int, default=1024)
+    parser.add_argument("--vad_replay_size", type=int, default=1)
+    parser.add_argument("--vad_batch_length", type=int, default=1)
+    parser.add_argument("--vad_no_disk_replay_buffer", action="store_true")
     parser.add_argument("--vad_no_birdeye", action="store_true")
     args, rest = parser.parse_known_args(argv)
     return args, rest
+
+
+def _has_flag(argv, name):
+    prefix = f"--{name}"
+    return any(item == prefix or item.startswith(f"{prefix}=") for item in argv)
+
+
+def _flag_value(argv, name, default):
+    prefix = f"--{name}"
+    for index, item in enumerate(argv):
+        if item == prefix and index + 1 < len(argv):
+            return argv[index + 1]
+        if item.startswith(f"{prefix}="):
+            return item.split("=", 1)[1]
+    return str(default)
 
 
 def main(argv=None) -> None:
@@ -64,6 +83,14 @@ def main(argv=None) -> None:
     )
     if "--task" not in rest:
         rest = ["--task", args.task, *rest]
+    if not _has_flag(rest, "dreamerv3.replay_chunks"):
+        rest = ["--dreamerv3.replay_chunks", str(args.vad_replay_chunks), *rest]
+    if not _has_flag(rest, "dreamerv3.replay_size"):
+        rest = ["--dreamerv3.replay_size", str(args.vad_replay_size), *rest]
+    if not _has_flag(rest, "dreamerv3.batch_length"):
+        rest = ["--dreamerv3.batch_length", str(args.vad_batch_length), *rest]
+    if not _has_flag(rest, "dreamerv3.replay_disk_buffer"):
+        rest = ["--dreamerv3.replay_disk_buffer", str(not args.vad_no_disk_replay_buffer), *rest]
 
     collect_polyplanner = load_collect_polyplanner()
 
@@ -72,6 +99,13 @@ def main(argv=None) -> None:
     print(
         "[vad_collect] camera="
         f"{args.vad_camera_width}x{args.vad_camera_height} fov={args.vad_camera_fov} tick={args.vad_sensor_tick}"
+    )
+    print(
+        "[vad_collect] replay memory limits="
+        f"chunks={_flag_value(rest, 'dreamerv3.replay_chunks', args.vad_replay_chunks)} "
+        f"replay_size={_flag_value(rest, 'dreamerv3.replay_size', args.vad_replay_size)} "
+        f"batch_length={_flag_value(rest, 'dreamerv3.batch_length', args.vad_batch_length)} "
+        f"disk_buffer={_flag_value(rest, 'dreamerv3.replay_disk_buffer', not args.vad_no_disk_replay_buffer)}"
     )
     collect_polyplanner.main(rest)
 

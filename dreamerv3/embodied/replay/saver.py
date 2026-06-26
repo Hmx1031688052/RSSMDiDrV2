@@ -1,6 +1,5 @@
 import concurrent.futures
 from collections import defaultdict, deque
-from functools import partial as bind
 
 import embodied
 
@@ -8,14 +7,24 @@ from . import chunk as chunklib
 
 
 class Saver:
-    def __init__(self, directory, chunks=1024):
+    def __init__(self, directory, chunks=1024, disk_buffer=False):
         self.directory = embodied.Path(directory)
         self.directory.mkdirs()
         self.chunks = chunks
-        self.buffers = defaultdict(bind(chunklib.Chunk, chunks))
-        self.workers = concurrent.futures.ThreadPoolExecutor(16)
+        self.disk_buffer = bool(disk_buffer)
+        self.tempdir = self.directory / "_tmp_chunks"
+        if self.disk_buffer:
+            self.tempdir.mkdirs()
+        self.buffers = defaultdict(self._make_chunk)
+        workers = 1 if self.disk_buffer else 16
+        self.workers = concurrent.futures.ThreadPoolExecutor(workers)
         self.promises = deque()
         self.loading = False
+
+    def _make_chunk(self):
+        if self.disk_buffer:
+            return chunklib.DiskChunk(self.chunks, tempdir=str(self.tempdir))
+        return chunklib.Chunk(self.chunks)
 
     def add(self, step, worker):
         if self.loading:
@@ -23,7 +32,7 @@ class Saver:
         buffer = self.buffers[worker]
         buffer.append(step)
         if buffer.length >= self.chunks:
-            self.buffers[worker] = buffer.successor = chunklib.Chunk(self.chunks)
+            self.buffers[worker] = buffer.successor = self._make_chunk()
             self.promises.append(self.workers.submit(buffer.save, self.directory))
             for promise in [x for x in self.promises if x.done()]:
                 promise.result()
