@@ -1,6 +1,8 @@
 import datetime
 import math
 import pathlib
+import queue
+import threading
 import time
 import warnings
 
@@ -642,12 +644,12 @@ def _ensure_bool_vector(value):
 
 
 def _build_replay_step(tran, info):
-    step_data = {k: np.array(v, copy=True) for k, v in tran.items()}
+    step_data = {k: np.asarray(v) for k, v in tran.items()}
     step_data["id"] = np.asarray(embodied.uuid(step_data.get("id")))
 
     if "is_first" in step_data:
-        step_data["episode_start"] = np.array(step_data["is_first"], copy=True)
-        step_data["reset_export"] = np.array(step_data["is_first"], copy=True)
+        step_data["episode_start"] = np.asarray(step_data["is_first"])
+        step_data["reset_export"] = np.asarray(step_data["is_first"])
 
     defaults = _replay_step_defaults()
     for key, default in defaults.items():
@@ -662,20 +664,47 @@ def _build_replay_step(tran, info):
 
 
 class StreamingSuccessReplay:
-    """Write episode steps to disk as they arrive, commit only successes."""
+    """Queue episode steps and write them on a background thread."""
 
-    def __init__(self, saver, replay_dir, chunk_size):
+    def __init__(self, saver, replay_dir, chunk_size, queue_size=8):
         self.saver = saver
         self.replay_dir = replay_dir
         self.chunk_size = int(chunk_size)
         self.tempdir = str(replay_dir / "_tmp_episode_chunks")
+        self.queue = queue.Queue(maxsize=int(queue_size))
         self.ready = []
-        self.current = self._new_chunk()
+        self.current = None
+        self.saved_steps = 0
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name="streaming_replay_writer", daemon=True)
+        self._thread.start()
 
     def _new_chunk(self):
         return chunklib.DiskChunk(self.chunk_size, tempdir=self.tempdir)
 
     def append(self, step_data):
+        self.queue.put(("step", step_data))
+
+    def commit(self):
+        self.queue.put(("commit", None))
+
+    def discard(self):
+        self.queue.put(("discard", None))
+
+    def close(self):
+        if self._closed:
+            return
+        self.queue.put(("close", None))
+        self.queue.join()
+        self._thread.join(timeout=5.0)
+        self._closed = True
+
+    def _ensure_current(self):
+        if self.current is None:
+            self.current = self._new_chunk()
+
+    def _append_now(self, step_data):
+        self._ensure_current()
         self.current.append(step_data)
         if self.current.length >= self.chunk_size:
             next_chunk = self._new_chunk()
@@ -683,24 +712,43 @@ class StreamingSuccessReplay:
             self.ready.append(self.current)
             self.current = next_chunk
 
-    def commit(self):
+    def _commit_now(self):
         chunks = list(self.ready)
-        if self.current.length:
+        if self.current is not None and self.current.length:
             chunks.append(self.current)
         saved_steps = sum(chunk.length for chunk in chunks)
         for chunk in chunks:
             self.saver.promises.append(self.saver.workers.submit(chunk.save, self.replay_dir))
+        self.saved_steps += saved_steps
         self.ready = []
-        self.current = self._new_chunk()
+        self.current = None
         return saved_steps
 
-    def discard(self):
+    def _discard_now(self):
         for chunk in self.ready:
             chunk.close()
         if self.current is not None:
             self.current.close()
         self.ready = []
-        self.current = self._new_chunk()
+        self.current = None
+
+    def _run(self):
+        while True:
+            command, payload = self.queue.get()
+            try:
+                if command == "step":
+                    self._append_now(payload)
+                elif command == "commit":
+                    self._commit_now()
+                elif command == "discard":
+                    self._discard_now()
+                elif command == "close":
+                    self._discard_now()
+                    return
+                else:
+                    raise ValueError(f"Unknown replay writer command: {command}")
+            finally:
+                self.queue.task_done()
 def main(argv=None):
     yaml_path = pathlib.Path(__file__).resolve().with_name("dreamerv3.yaml")
     model_configs = yaml.YAML(typ="safe").load(
@@ -766,11 +814,13 @@ def main(argv=None):
     saved_steps = {"count": 0}
     episode_return_state = {"value": 0.0}
     episode_success_state = {"value": False}
+    episode_steps_state = {"value": 0}
     target_episodes = int(config.env.expert_collection.episodes)
     stream_replay = StreamingSuccessReplay(
         saver=replay.saver,
         replay_dir=replay_dir,
         chunk_size=int(getattr(cfg, "replay_chunks", 1024)),
+        queue_size=int(getattr(cfg, "replay_queue_size", 8)),
     )
 
     def on_step(tran, inf, worker):
@@ -778,8 +828,10 @@ def main(argv=None):
         if bool(np.asarray(tran.get("is_first", False)).reshape(-1)[-1]):
             episode_return_state["value"] = 0.0
             episode_success_state["value"] = False
+            episode_steps_state["value"] = 0
         stream_replay.append(_build_replay_step(tran, inf))
         episode_return_state["value"] += float(np.asarray(tran.get("reward", 0.0)).reshape(-1)[-1])
+        episode_steps_state["value"] += 1
         for src in (inf, tran):
             for key in ("destination_reached", "is_success"):
                 result = _last_bool_from_source(src, key)
@@ -795,8 +847,8 @@ def main(argv=None):
         episode_return = float(episode_return_state["value"])
 
         if success:
-            committed = stream_replay.commit()
-            saved_steps["count"] += committed
+            stream_replay.commit()
+            saved_steps["count"] += episode_steps_state["value"]
             saved_episodes["count"] += 1
         else:
             stream_replay.discard()
@@ -839,6 +891,10 @@ def main(argv=None):
     finally:
         try:
             stream_replay.discard()
+        except Exception:
+            pass
+        try:
+            stream_replay.close()
         except Exception:
             pass
         try:
