@@ -13,10 +13,11 @@ class Driver:
         bool: bool,
     }
 
-    def __init__(self, env, **kwargs):
+    def __init__(self, env, store_episodes=True, **kwargs):
         assert len(env) > 0
         self._env = env
         self._kwargs = kwargs
+        self._store_episodes = bool(store_episodes)
         self._on_steps = []
         self._on_episodes = []
         self.reset()
@@ -54,7 +55,7 @@ class Driver:
         acts["reset"] = obs["is_last"].copy()
         self._acts = acts
         trns = {**obs, **acts}
-        if obs["is_first"].any():
+        if self._store_episodes and obs["is_first"].any():
             for i, first in enumerate(obs["is_first"]):
                 if first:
                     self._eps[i].clear()
@@ -62,15 +63,20 @@ class Driver:
         for i in range(len(self._env)):
             trn = {k: v[i] for k, v in trns.items()}
             inf = {k: v[i] for k, v in info.items()}
-            [self._eps[i][k].append(v) for k, v in trn.items()]
-            [self._eps_info[i][k].append(v) for k, v in inf.items()]
+            if self._store_episodes:
+                [self._eps[i][k].append(v) for k, v in trn.items()]
+                [self._eps_info[i][k].append(v) for k, v in inf.items()]
             [fn(trn, inf, i, **self._kwargs) for fn in self._on_steps]
             step += 1
         if obs["is_last"].any():
             for i, done in enumerate(obs["is_last"]):
                 if done:
-                    ep = {k: convert(v) for k, v in self._eps[i].items()}
-                    ep_info = {k: convert(v) for k, v in self._eps_info[i].items()}
+                    if self._store_episodes:
+                        ep = {k: convert(v) for k, v in self._eps[i].items()}
+                        ep_info = {k: convert(v) for k, v in self._eps_info[i].items()}
+                    else:
+                        ep = {}
+                        ep_info = {}
                     [fn(ep.copy(), ep_info.copy(), i, **self._kwargs) for fn in self._on_episodes]
                     episode += 1
         return step, episode

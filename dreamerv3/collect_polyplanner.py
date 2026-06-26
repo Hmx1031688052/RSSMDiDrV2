@@ -18,6 +18,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 import car_dreamer
 from collect_utils import make_replay, wrap_env
 from embodied.envs import from_gym
+from embodied.replay import chunk as chunklib
 
 
 warnings.filterwarnings("ignore", ".*truncated to dtype int32.*")
@@ -625,21 +626,6 @@ def _pick_timestep_value(src, key, t):
 
     return np.array(arr[t], copy=True)
 
-def _episode_length(ep):
-    for value in ep.values():
-        arr = np.asarray(value)
-        if arr.ndim > 0:
-            return int(arr.shape[0])
-    return 0
-
-def _episode_step(ep, t):
-    step = {}
-    for key, value in ep.items():
-        arr = np.asarray(value)
-        if arr.ndim > 0 and arr.shape[0] > t:
-            step[key] = np.array(arr[t], copy=True)
-    return step
-
 def _replay_step_defaults():
     return {
         "destination_reached": np.array([False], dtype=np.bool_),
@@ -653,6 +639,67 @@ def _ensure_bool_vector(value):
     if value.shape == ():
         value = value.reshape(1)
     return value
+
+
+def _build_replay_step(tran, info):
+    step_data = {k: np.array(v, copy=True) for k, v in tran.items()}
+
+    if "is_first" in step_data:
+        step_data["episode_start"] = np.array(step_data["is_first"], copy=True)
+        step_data["reset_export"] = np.array(step_data["is_first"], copy=True)
+
+    defaults = _replay_step_defaults()
+    for key, default in defaults.items():
+        if key in info:
+            value = info[key]
+        elif key in tran:
+            value = tran[key]
+        else:
+            value = default
+        step_data[key] = _ensure_bool_vector(value)
+    return step_data
+
+
+class StreamingSuccessReplay:
+    """Write episode steps to disk as they arrive, commit only successes."""
+
+    def __init__(self, saver, replay_dir, chunk_size):
+        self.saver = saver
+        self.replay_dir = replay_dir
+        self.chunk_size = int(chunk_size)
+        self.tempdir = str(replay_dir / "_tmp_episode_chunks")
+        self.ready = []
+        self.current = self._new_chunk()
+
+    def _new_chunk(self):
+        return chunklib.DiskChunk(self.chunk_size, tempdir=self.tempdir)
+
+    def append(self, step_data):
+        self.current.append(step_data)
+        if self.current.length >= self.chunk_size:
+            next_chunk = self._new_chunk()
+            self.current.successor = next_chunk
+            self.ready.append(self.current)
+            self.current = next_chunk
+
+    def commit(self):
+        chunks = list(self.ready)
+        if self.current.length:
+            chunks.append(self.current)
+        saved_steps = sum(chunk.length for chunk in chunks)
+        for chunk in chunks:
+            self.saver.promises.append(self.saver.workers.submit(chunk.save, self.replay_dir))
+        self.ready = []
+        self.current = self._new_chunk()
+        return saved_steps
+
+    def discard(self):
+        for chunk in self.ready:
+            chunk.close()
+        if self.current is not None:
+            self.current.close()
+        self.ready = []
+        self.current = self._new_chunk()
 def main(argv=None):
     yaml_path = pathlib.Path(__file__).resolve().with_name("dreamerv3.yaml")
     model_configs = yaml.YAML(typ="safe").load(
@@ -715,53 +762,50 @@ def main(argv=None):
 
     episodes_done = {"count": 0}
     saved_episodes = {"count": 0}
+    saved_steps = {"count": 0}
+    episode_return_state = {"value": 0.0}
+    episode_success_state = {"value": False}
     target_episodes = int(config.env.expert_collection.episodes)
+    stream_replay = StreamingSuccessReplay(
+        saver=replay.saver,
+        replay_dir=replay_dir,
+        chunk_size=int(getattr(cfg, "replay_chunks", 1024)),
+    )
 
-    def on_step(tran, _, worker):
-        del tran, worker
+    def on_step(tran, inf, worker):
+        del worker
+        if bool(np.asarray(tran.get("is_first", False)).reshape(-1)[-1]):
+            episode_return_state["value"] = 0.0
+            episode_success_state["value"] = False
+        stream_replay.append(_build_replay_step(tran, inf))
+        episode_return_state["value"] += float(np.asarray(tran.get("reward", 0.0)).reshape(-1)[-1])
+        for src in (inf, tran):
+            for key in ("destination_reached", "is_success"):
+                result = _last_bool_from_source(src, key)
+                if result is not None:
+                    episode_success_state["value"] = bool(result)
         step.increment()
 
     def on_episode(ep, ep_info, worker):
         del worker
         episodes_done["count"] += 1
 
-        success = _is_success_episode(ep, ep_info)
-        episode_return = float(np.asarray(ep["reward"]).sum())
+        success = bool(episode_success_state["value"])
+        episode_return = float(episode_return_state["value"])
 
         if success:
-            defaults = _replay_step_defaults()
-
-            for t in range(_episode_length(ep)):
-                step_data = _episode_step(ep, t)
-
-                if "is_first" in step_data:
-                    step_data["episode_start"] = np.array(step_data["is_first"], copy=True)
-                    step_data["reset_export"] = np.array(step_data["is_first"], copy=True)
-
-                # ep contains the reset transition; ep_info starts at env steps.
-                info_t = t - 1
-                for key, default in defaults.items():
-                    value = None
-                    if info_t >= 0:
-                        value = _pick_timestep_value(ep_info, key, info_t)
-                        if value is None:
-                            value = _pick_timestep_value(ep, key, info_t)
-
-                    if value is None:
-                        value = np.array(default, copy=True)
-
-                    step_data[key] = _ensure_bool_vector(value)
-
-
-                replay.add(step_data, 0)
-
+            committed = stream_replay.commit()
+            saved_steps["count"] += committed
             saved_episodes["count"] += 1
+        else:
+            stream_replay.discard()
 
         last_env_action = policy.last_env_actions[0]
         logger.add(
             {
                 "episodes": episodes_done["count"],
                 "saved_episodes": saved_episodes["count"],
+                "saved_steps": saved_steps["count"],
                 "success": float(success),
                 "episode_return": episode_return,
                 "last_acc_env": float(last_env_action[0]),
@@ -775,12 +819,13 @@ def main(argv=None):
             f"[ROS2 Expert Collect] episode={episodes_done['count']} "
             f"success={success} saved={saved_episodes['count']} "
             f"return={episode_return:.3f} "
-            f"replay_size={len(replay)}",
+            f"saved_steps={saved_steps['count']} "
+            f"pending_saves={len(replay.saver.promises)}",
             flush=True,
         )
 
 
-    driver = embodied.Driver(env)
+    driver = embodied.Driver(env, store_episodes=False)
     driver.on_step(on_step)
     driver.on_episode(on_episode)
 
@@ -791,6 +836,10 @@ def main(argv=None):
         replay.save(wait=True)
         logger.write()
     finally:
+        try:
+            stream_replay.discard()
+        except Exception:
+            pass
         try:
             ros_bridge.destroy_node()
         except Exception:
