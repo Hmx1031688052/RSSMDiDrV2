@@ -77,7 +77,7 @@ class Chunk:
 
 
 class DiskChunk:
-    """Replay chunk buffered as per-key memmaps to avoid large RAM spikes."""
+    """Replay chunk buffered as append-only raw files to avoid RAM spikes."""
 
     def __init__(self, size, successor=None, tempdir=None):
         now = datetime.now()
@@ -88,6 +88,8 @@ class DiskChunk:
         self.tempdir = pathlib.Path(str(tempdir or tempfile.gettempdir()))
         self.data = None
         self.paths = {}
+        self.handles = {}
+        self.metadata = {}
         self.length = 0
         self.workdir = None
 
@@ -109,12 +111,21 @@ class DiskChunk:
             example = {k: embodied.convert(v) for k, v in step.items()}
             self.data = {}
             for index, (key, value) in enumerate(example.items()):
-                path = self.workdir / f"{index:06d}.npy"
-                shape = (self.size,) + value.shape
-                self.data[key] = np.lib.format.open_memmap(path, mode="w+", dtype=value.dtype, shape=shape)
+                value = np.asarray(value)
+                path = self.workdir / f"{index:06d}.bin"
+                self.data[key] = None
                 self.paths[key] = path
+                self.metadata[key] = (value.dtype, value.shape)
+                self.handles[key] = open(path, "wb")
         for key, value in step.items():
-            self.data[key][self.length] = value
+            value = np.asarray(value)
+            dtype, shape = self.metadata[key]
+            if value.dtype != dtype or value.shape != shape:
+                raise ValueError(
+                    f"Replay key {key!r} changed from dtype={dtype} shape={shape} "
+                    f"to dtype={value.dtype} shape={value.shape}"
+                )
+            self.handles[key].write(np.ascontiguousarray(value).tobytes(order="C"))
         self.length += 1
 
     def save(self, directory):
@@ -123,29 +134,35 @@ class DiskChunk:
         filename = f"{self.time}-{self.uuid}-{succ}-{self.length}.npz"
         filename = embodied.Path(directory) / filename
         try:
-            with zipfile.ZipFile(str(filename), mode="w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-                for key, value in self.data.items():
-                    value.flush()
+            self._close_handles()
+            with zipfile.ZipFile(str(filename), mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                for key, path in self.paths.items():
+                    dtype, shape = self.metadata[key]
                     with archive.open(f"{key}.npy", mode="w", force_zip64=True) as stream:
-                        np.lib.format.write_array(stream, value[: self.length], allow_pickle=False)
+                        header = {
+                            "descr": np.lib.format.dtype_to_descr(np.dtype(dtype)),
+                            "fortran_order": False,
+                            "shape": (self.length,) + tuple(shape),
+                        }
+                        np.lib.format.write_array_header_2_0(stream, header)
+                        with open(path, "rb") as raw:
+                            shutil.copyfileobj(raw, stream, length=16 * 1024 * 1024)
             print(f"Saved chunk: {filename.name}")
         finally:
             self.close()
 
+    def _close_handles(self):
+        for handle in self.handles.values():
+            try:
+                handle.flush()
+                handle.close()
+            except Exception:
+                pass
+        self.handles = {}
+
     def close(self):
-        if self.data is not None:
-            for value in self.data.values():
-                try:
-                    value.flush()
-                except Exception:
-                    pass
-                mmap = getattr(value, "_mmap", None)
-                if mmap is not None:
-                    try:
-                        mmap.close()
-                    except Exception:
-                        pass
-            self.data = None
+        self._close_handles()
+        self.data = None
         if self.workdir is not None:
             shutil.rmtree(self.workdir, ignore_errors=True)
             self.workdir = None

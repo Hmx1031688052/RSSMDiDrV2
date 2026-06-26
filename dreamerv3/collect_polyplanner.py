@@ -643,6 +643,7 @@ def _ensure_bool_vector(value):
 
 def _build_replay_step(tran, info):
     step_data = {k: np.array(v, copy=True) for k, v in tran.items()}
+    step_data["id"] = np.asarray(embodied.uuid(step_data.get("id")))
 
     if "is_first" in step_data:
         step_data["episode_start"] = np.array(step_data["is_first"], copy=True)

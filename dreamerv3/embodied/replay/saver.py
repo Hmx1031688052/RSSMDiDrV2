@@ -16,7 +16,7 @@ class Saver:
         if self.disk_buffer:
             self.tempdir.mkdirs()
         self.buffers = defaultdict(self._make_chunk)
-        workers = 1 if self.disk_buffer else 16
+        workers = 4 if self.disk_buffer else 16
         self.workers = concurrent.futures.ThreadPoolExecutor(workers)
         self.promises = deque()
         self.loading = False
