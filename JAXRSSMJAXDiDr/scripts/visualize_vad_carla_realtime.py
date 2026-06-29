@@ -283,20 +283,22 @@ def make_absolute_can_bus(pose: dict) -> np.ndarray:
     internally before temporal BEV fusion.
     """
 
-    can_bus = np.zeros((18,), dtype=np.float32)
+    # Keep float64 here to match Bench2Drive's original agent. Older
+    # torchvision.rotate accepts np.float64 as a Python float-like scalar but
+    # rejects np.float32 for the prev_bev rotation angle.
+    can_bus = np.zeros((18,))
     can_bus[0] = float(pose["x"])
     can_bus[1] = float(pose["y"])
     yaw = float(pose["yaw"])
     half_yaw = 0.5 * yaw
     can_bus[3:7] = np.asarray(
         [np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)],
-        dtype=np.float32,
     )
     can_bus[7] = float(pose.get("speed", 0.0))
     if "acceleration" in pose:
-        can_bus[10:13] = np.asarray(pose["acceleration"], dtype=np.float32).reshape(3)
+        can_bus[10:13] = np.asarray(pose["acceleration"]).reshape(3)
     if "angular_velocity" in pose:
-        can_bus[13:16] = np.asarray(pose["angular_velocity"], dtype=np.float32).reshape(3)
+        can_bus[13:16] = np.asarray(pose["angular_velocity"]).reshape(3)
     can_bus[16] = yaw
     can_bus[17] = float(np.degrees(yaw))
     return can_bus
