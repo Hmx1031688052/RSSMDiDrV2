@@ -60,6 +60,7 @@ Thumbs.db
 # External reference code, not pushed to this repo
 DiffusionDriveV2/
 /Bench2Drive/
+/Bench2DriveZoo-uniad-vad/
 !JAXRSSMJAXDiDr/bench2drive/
 !JAXRSSMJAXDiDr/bench2drive/*.py
 # JAXRSSMJAXDiDr/

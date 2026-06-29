@@ -75,6 +75,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     grpo_parser.add_argument("--grpo_grad_clip", type=float, default=1.0)
     grpo_parser.add_argument("--grpo_min_logprob_std", type=float, default=0.1)
     grpo_parser.add_argument("--grpo_additive_noise", action="store_true")
+    grpo_parser.add_argument("--grpo_reward_viz_every", type=int, default=0)
+    grpo_parser.add_argument("--grpo_reward_viz_samples", type=int, default=2)
+    grpo_parser.add_argument("--grpo_reward_viz_topk", type=int, default=5)
     grpo_parser.add_argument("--selector_after_grpo_updates", type=int, default=20)
     grpo_parser.add_argument("--selector_after_grpo_lr", type=float, default=2e-6)
     grpo_parser.add_argument("--selector_after_grpo_ranking_weight", type=float, default=1.0)
@@ -271,6 +274,8 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
         self.grpo_state = self.grpo_opt.init(self.planner_params)
         self.selector_light_state = self.selector_light_opt.init(self.selector_params)
         self.grpo_rng = jax.random.PRNGKey(int(args.seed) + 1701)
+        self.grpo_reward_viz_dir = self.output_dir / "grpo_reward_viz"
+        self.grpo_reward_viz_jsonl = self.grpo_reward_viz_dir / "rewards.jsonl"
         self._sample_chain = jax.jit(self._sample_chain_impl)
         self._grpo_step = jax.jit(self._grpo_step_impl)
         self._selector_light_step = jax.jit(self._selector_light_step_impl)
@@ -329,6 +334,217 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
         step_ok = jnp.max(step_dist, axis=-1) <= float(self.args.max_step_distance)
         forward_count = jnp.sum(xy[..., 0] >= float(self.args.min_forward_x), axis=-1)
         return finite & lateral_ok & step_ok & (forward_count >= int(self.args.min_valid_points))
+
+    def _maybe_visualize_grpo_rewards(
+        self,
+        outer_idx: int,
+        update_idx: int,
+        final_xy,
+        rewards,
+        target_rewards,
+        target_xy,
+        target_valid,
+        safety_mask,
+    ) -> None:
+        every = int(self.args.grpo_reward_viz_every)
+        if every <= 0 or int(update_idx) % every != 0:
+            return
+
+        sample_count = min(int(self.args.grpo_reward_viz_samples), int(final_xy.shape[0]))
+        if sample_count <= 0:
+            return
+
+        sign = jnp.asarray([float(self.args.plan_x_sign), float(self.args.plan_y_sign)], dtype=final_xy.dtype)
+        signed_xy = final_xy * sign.reshape((1, 1, 1, 1, 2))
+        safe_target_xy = jnp.where(target_valid[:, None, None], target_xy, 0.0)
+        signed_target_xy = safe_target_xy * sign.reshape((1, 1, 2))
+
+        reward_group = jax.lax.stop_gradient(rewards)
+        mean_grouped = reward_group.mean(axis=1, keepdims=True)
+        std_grouped = reward_group.std(axis=1, keepdims=True)
+        advantages = (reward_group - mean_grouped) / (std_grouped + float(self.args.grpo_adv_eps))
+        gt_mask = reward_group > (target_rewards[:, None, None] - 1e-6)
+        adv_with_gt = jnp.maximum(advantages, 0.0) * gt_mask.astype(advantages.dtype)
+        advantages = jnp.where(target_valid[:, None, None], adv_with_gt, 0.0)
+        advantages = jnp.where(target_valid[:, None, None] & safety_mask, advantages, 0.0)
+        advantages = jnp.where(
+            target_valid[:, None, None] & (~safety_mask),
+            float(self.args.grpo_unsafe_adv),
+            advantages,
+        )
+        advantages = jnp.clip(advantages, -float(self.args.adv_clip), float(self.args.adv_clip))
+        positive_mask = advantages > 0.0
+
+        arrays = jax.device_get(
+            {
+                "xy": signed_xy[:sample_count],
+                "rewards": rewards[:sample_count],
+                "target_rewards": target_rewards[:sample_count],
+                "target_xy": signed_target_xy[:sample_count],
+                "target_valid": target_valid[:sample_count],
+                "safety_mask": safety_mask[:sample_count],
+                "positive_mask": positive_mask[:sample_count],
+            }
+        )
+
+        self.grpo_reward_viz_dir.mkdir(parents=True, exist_ok=True)
+        for sample_idx in range(sample_count):
+            self._write_grpo_reward_viz_sample(outer_idx, update_idx, sample_idx, arrays)
+
+    def _write_grpo_reward_viz_sample(self, outer_idx: int, update_idx: int, sample_idx: int, arrays) -> None:
+        xy = np.asarray(arrays["xy"][sample_idx], dtype=np.float32)
+        rewards = np.asarray(arrays["rewards"][sample_idx], dtype=np.float32)
+        target_reward = float(np.asarray(arrays["target_rewards"][sample_idx]))
+        target_xy = np.asarray(arrays["target_xy"][sample_idx], dtype=np.float32)
+        target_valid = bool(np.asarray(arrays["target_valid"][sample_idx]))
+        safety_mask = np.asarray(arrays["safety_mask"][sample_idx], dtype=bool)
+        positive_mask = np.asarray(arrays["positive_mask"][sample_idx], dtype=bool)
+
+        finite_rewards = rewards[np.isfinite(rewards)]
+        if finite_rewards.size:
+            reward_min = float(finite_rewards.min())
+            reward_max = float(finite_rewards.max())
+            reward_mean = float(finite_rewards.mean())
+            reward_std = float(finite_rewards.std())
+        else:
+            reward_min = reward_max = reward_mean = reward_std = float("nan")
+
+        record = {
+            "outer": int(outer_idx),
+            "update": int(update_idx),
+            "sample_index": int(sample_idx),
+            "returns": rewards.tolist(),
+            "target_return": target_reward,
+            "target_valid": target_valid,
+            "safety_mask": safety_mask.tolist(),
+            "positive_mask": positive_mask.tolist(),
+            "reward_min": reward_min,
+            "reward_max": reward_max,
+            "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "trajectories_xy": xy.tolist(),
+            "target_xy_for_rssm": target_xy.tolist(),
+        }
+        with self.grpo_reward_viz_jsonl.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+        self._plot_grpo_reward_viz_sample(
+            outer_idx,
+            update_idx,
+            sample_idx,
+            xy,
+            rewards,
+            target_reward,
+            target_xy,
+            target_valid,
+            safety_mask,
+            positive_mask,
+        )
+
+    def _plot_grpo_reward_viz_sample(
+        self,
+        outer_idx: int,
+        update_idx: int,
+        sample_idx: int,
+        xy: np.ndarray,
+        rewards: np.ndarray,
+        target_reward: float,
+        target_xy: np.ndarray,
+        target_valid: bool,
+        safety_mask: np.ndarray,
+        positive_mask: np.ndarray,
+    ) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+        from matplotlib.cm import ScalarMappable
+
+        flat_xy = xy.reshape((-1, xy.shape[-2], xy.shape[-1]))
+        flat_rewards = rewards.reshape((-1,))
+        flat_safety = safety_mask.reshape((-1,))
+        finite_rewards = flat_rewards[np.isfinite(flat_rewards)]
+        if finite_rewards.size:
+            vmin = float(finite_rewards.min())
+            vmax = float(finite_rewards.max())
+            if np.isclose(vmin, vmax):
+                vmin -= 0.5
+                vmax += 0.5
+        else:
+            vmin, vmax = -1.0, 1.0
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        cmap = plt.get_cmap("viridis")
+
+        fig, ax = plt.subplots(figsize=(7.0, 6.2), dpi=140)
+        for traj, reward, safe in zip(flat_xy, flat_rewards, flat_safety):
+            color = cmap(norm(float(reward))) if np.isfinite(reward) else "#999999"
+            ax.plot(
+                traj[:, 0],
+                traj[:, 1],
+                color=color,
+                linewidth=1.2 if safe else 0.9,
+                linestyle="-" if safe else "--",
+                alpha=0.78 if safe else 0.35,
+            )
+
+        topk = min(max(int(self.args.grpo_reward_viz_topk), 0), flat_rewards.size)
+        finite_order = np.argsort(np.where(np.isfinite(flat_rewards), flat_rewards, -np.inf))[::-1]
+        finite_order = [idx for idx in finite_order if np.isfinite(flat_rewards[idx])][:topk]
+        for rank, flat_idx in enumerate(finite_order, start=1):
+            traj = flat_xy[flat_idx]
+            reward = float(flat_rewards[flat_idx])
+            color = cmap(norm(reward))
+            ax.plot(traj[:, 0], traj[:, 1], color=color, linewidth=2.4, alpha=0.95)
+            ax.text(
+                traj[-1, 0],
+                traj[-1, 1],
+                f"{rank}:{reward:.3f}",
+                fontsize=7,
+                color="#111111",
+                ha="left",
+                va="center",
+            )
+
+        if target_valid:
+            ax.plot(target_xy[:, 0], target_xy[:, 1], color="#111111", linewidth=2.6, label="target")
+            ax.scatter(target_xy[-1, 0], target_xy[-1, 1], color="#111111", s=18, zorder=5)
+
+        all_points = flat_xy.reshape((-1, 2))
+        if target_valid:
+            all_points = np.concatenate([all_points, target_xy.reshape((-1, 2))], axis=0)
+        finite_points = all_points[np.all(np.isfinite(all_points), axis=1)]
+        if finite_points.size:
+            x_min, y_min = finite_points.min(axis=0)
+            x_max, y_max = finite_points.max(axis=0)
+            pad_x = max(2.0, 0.08 * float(x_max - x_min + 1e-6))
+            pad_y = max(2.0, 0.08 * float(y_max - y_min + 1e-6))
+            ax.set_xlim(float(x_min - pad_x), float(x_max + pad_x))
+            ax.set_ylim(float(y_min - pad_y), float(y_max + pad_y))
+
+        positive_ratio = float(np.mean(positive_mask)) if positive_mask.size else 0.0
+        unsafe_ratio = float(np.mean(~safety_mask)) if safety_mask.size else 0.0
+        ax.axhline(0.0, color="#cccccc", linewidth=0.8)
+        ax.axvline(0.0, color="#cccccc", linewidth=0.8)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x forward (m)")
+        ax.set_ylabel("y lateral (m)")
+        ax.set_title(
+            f"GRPO RSSM returns outer={outer_idx} update={update_idx} sample={sample_idx} "
+            f"target={target_reward:.4f} positive={positive_ratio:.3f} unsafe={unsafe_ratio:.3f}"
+        )
+        if target_valid:
+            ax.legend(loc="best")
+
+        sm = ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax)
+        cbar.set_label("RSSM discounted return")
+
+        fig.tight_layout()
+        output = self.grpo_reward_viz_dir / f"outer_{outer_idx:04d}_update_{update_idx:05d}_sample_{sample_idx:02d}.png"
+        fig.savefig(output)
+        plt.close(fig)
 
     def _grpo_step_impl(
         self,
@@ -457,6 +673,16 @@ class GRPOWorldModelTrainer(StableOnlineTrainer):
             safe_target_xy = jnp.where(target_valid[:, None, None], target_xy, 0.0)
             target_rewards = self.returns_from_target(state, speed, neighbors, safe_target_xy[:, None])[:, 0]
             safety_mask = self._trajectory_safety_mask(final_xy)
+            self._maybe_visualize_grpo_rewards(
+                outer_idx,
+                update,
+                final_xy,
+                rewards,
+                target_rewards,
+                target_xy,
+                target_valid,
+                safety_mask,
+            )
 
             self.planner_params, self.grpo_state, metrics = self._grpo_step(
                 self.planner_params,
