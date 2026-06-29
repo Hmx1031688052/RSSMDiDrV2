@@ -29,7 +29,12 @@ from JAXRSSMJAXDiDr.scripts.export_vad_latents import (
     normalize_vad_runtime_args,
 )
 from JAXRSSMJAXDiDr.vad_carla import install_vad_carla_patches
-from JAXRSSMJAXDiDr.vad_carla.camera_setup import get_camera_keys, get_camera_order
+from JAXRSSMJAXDiDr.vad_carla.camera_setup import (
+    get_camera_keys,
+    get_camera_order,
+    lidar2cam_matrices,
+    lidar2img_matrices,
+)
 
 
 def parse_args(argv=None):
@@ -71,6 +76,19 @@ def parse_args(argv=None):
     parser.add_argument("--surround_width", type=int, default=960)
     parser.add_argument("--vad_every", type=int, default=1)
     parser.add_argument("--no_temporal_bev", action="store_true")
+    parser.add_argument(
+        "--b2d_direct_head",
+        action="store_true",
+        help="Use the old direct pts_bbox_head path instead of the B2D detector inference pipeline.",
+    )
+    parser.add_argument(
+        "--b2d_dummy_command_idx",
+        type=int,
+        default=3,
+        choices=range(6),
+        metavar="[0-5]",
+        help="Dummy B2D command one-hot index used only to satisfy VAD's planning branch during perception visualization.",
+    )
     parser.add_argument("--vad_debug", action="store_true")
     parser.add_argument("--vad_debug_every", type=int, default=50)
     parser.add_argument("--vad_debug_overlay", action="store_true")
@@ -226,6 +244,178 @@ def run_vad_tensor(torch, model, img_np, meta, args, prev_bev):
         bbox_list = model.pts_bbox_head.get_bboxes(outs, [meta], rescale=False)
     result = decode_bbox_list(bbox_list[0], outs)
     return result["bev_embed"], result
+
+
+def use_b2d_detector_inference(args) -> bool:
+    return getattr(args, "vad_runtime", "official") == "b2d" and not bool(args.b2d_direct_head)
+
+
+def build_b2d_inference_pipeline(args, cfg):
+    if not use_b2d_detector_inference(args):
+        return None, None
+    from mmcv.datasets.pipelines import Compose
+    from mmcv.parallel.collate import collate as mm_collate_to_batch_form
+
+    pipeline_cfg = [
+        step
+        for step in cfg.inference_only_pipeline
+        if step["type"] not in ("LoadMultiViewImageFromFilesInCeph", "LoadMultiViewImageFromFiles")
+    ]
+    return Compose(pipeline_cfg), mm_collate_to_batch_form
+
+
+def reset_vad_temporal_state(model) -> None:
+    if hasattr(model, "prev_frame_info"):
+        model.prev_frame_info = {
+            "prev_bev": None,
+            "scene_token": None,
+            "prev_pos": 0,
+            "prev_angle": 0,
+        }
+    if hasattr(model, "prev_frame_infos"):
+        model.prev_frame_infos = []
+
+
+def make_absolute_can_bus(pose: dict) -> np.ndarray:
+    """Build B2D detector metadata with absolute pose.
+
+    The B2D detector wrapper converts these absolute fields to frame deltas
+    internally before temporal BEV fusion.
+    """
+
+    can_bus = np.zeros((18,), dtype=np.float32)
+    can_bus[0] = float(pose["x"])
+    can_bus[1] = float(pose["y"])
+    yaw = float(pose["yaw"])
+    half_yaw = 0.5 * yaw
+    can_bus[3:7] = np.asarray(
+        [np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)],
+        dtype=np.float32,
+    )
+    can_bus[7] = float(pose.get("speed", 0.0))
+    if "acceleration" in pose:
+        can_bus[10:13] = np.asarray(pose["acceleration"], dtype=np.float32).reshape(3)
+    if "angular_velocity" in pose:
+        can_bus[13:16] = np.asarray(pose["angular_velocity"], dtype=np.float32).reshape(3)
+    can_bus[16] = yaw
+    can_bus[17] = float(np.degrees(yaw))
+    return can_bus
+
+
+def make_b2d_detector_results(images, pose, args, cfg, box_type_3d, step: int) -> dict:
+    camera_order = get_camera_order(args.camera_profile)
+    loader_expects_bgr = bool(cfg.img_norm_cfg.get("to_rgb", False))
+    imgs = []
+    for image in images:
+        arr = np.asarray(image, dtype=np.float32)
+        if loader_expects_bgr:
+            arr = arr[..., ::-1]
+        imgs.append(arr)
+    lidar2img = np.stack(
+        lidar2img_matrices(
+            args.camera_profile,
+            args.camera_width,
+            args.camera_height,
+            args.camera_fov,
+            scale=1.0,
+            lidar_x=float(args.vad_lidar_x),
+            lidar_y=float(args.vad_lidar_y),
+            lidar_z=float(args.vad_lidar_z),
+        ),
+        axis=0,
+    )
+    lidar2cam = np.stack(lidar2cam_matrices(args.camera_profile), axis=0)
+    stacked_shape = np.stack(imgs, axis=-1).shape
+    command_onehot = np.zeros(6, dtype=np.float32)
+    command_onehot[int(args.b2d_dummy_command_idx)] = 1.0
+    return {
+        "filename": list(camera_order),
+        "lidar2img": lidar2img,
+        "lidar2cam": lidar2cam,
+        "img": imgs,
+        "folder": str(Path(args.task)),
+        "scene_token": str(Path(args.task).stem),
+        "frame_idx": int(step),
+        "sample_idx": int(step),
+        "timestamp": float(step) * float(args.sensor_tick),
+        "box_type_3d": box_type_3d,
+        "img_shape": stacked_shape,
+        "ori_shape": stacked_shape,
+        "pad_shape": stacked_shape,
+        "can_bus": make_absolute_can_bus(pose),
+        "command": int(args.b2d_dummy_command_idx),
+        "ego_fut_cmd": command_onehot,
+    }
+
+
+def _move_b2d_batch_to_device(torch, batch, device: str) -> None:
+    for key, data in batch.items():
+        if key == "img_metas":
+            continue
+        if isinstance(data, (list, tuple)) and data and torch.is_tensor(data[0]):
+            data[0] = data[0].to(device)
+        elif torch.is_tensor(data):
+            batch[key] = data.to(device)
+
+
+def _data_container_payload(value):
+    return getattr(value, "data", value)
+
+
+def extract_b2d_pipeline_meta(results: dict) -> dict:
+    meta = results["img_metas"]
+    if isinstance(meta, (list, tuple)):
+        meta = meta[0]
+    meta = _data_container_payload(meta)
+    if isinstance(meta, (list, tuple)):
+        meta = meta[0]
+    return meta
+
+
+def decode_detector_output(output_data_batch, model) -> dict:
+    if not output_data_batch:
+        raise ValueError("B2D detector returned an empty output batch.")
+    pts_bbox = output_data_batch[0].get("pts_bbox", output_data_batch[0])
+    prev_info = getattr(model, "prev_frame_info", {})
+    return {
+        "boxes": pts_bbox.get("boxes_3d"),
+        "scores": pts_bbox.get("scores_3d"),
+        "labels": pts_bbox.get("labels_3d"),
+        "trajs": pts_bbox.get("trajs_3d"),
+        "trajs_cls": None,
+        "map_bboxes": pts_bbox.get("map_boxes_3d"),
+        "map_scores": pts_bbox.get("map_scores_3d"),
+        "map_labels": pts_bbox.get("map_labels_3d"),
+        "map_pts": pts_bbox.get("map_pts_3d"),
+        "bev_embed": prev_info.get("prev_bev") if isinstance(prev_info, dict) else None,
+        "ego_fut_preds": pts_bbox.get("ego_fut_preds"),
+        "ego_fut_cmd": pts_bbox.get("ego_fut_cmd"),
+    }
+
+
+def run_b2d_detector_frame(
+    torch,
+    model,
+    images,
+    pose,
+    args,
+    cfg,
+    box_type_3d,
+    step: int,
+    pipeline,
+    collate_fn,
+):
+    if args.no_temporal_bev:
+        reset_vad_temporal_state(model)
+    results = make_b2d_detector_results(images, pose, args, cfg, box_type_3d, step)
+    results = pipeline(results)
+    meta = extract_b2d_pipeline_meta(results)
+    input_data_batch = collate_fn([results], samples_per_gpu=1)
+    _move_b2d_batch_to_device(torch, input_data_batch, args.device)
+    with torch.no_grad():
+        output_data_batch = model(input_data_batch, return_loss=False, rescale=True)
+    result = decode_detector_output(output_data_batch, model)
+    return result.get("bev_embed"), result, meta
 
 
 def decode_bbox_list(item, outs):
@@ -888,6 +1078,21 @@ def main(argv=None):
     import car_dreamer
 
     torch, model, cfg = build_vad(args)
+    b2d_pipeline, b2d_collate = build_b2d_inference_pipeline(args, cfg)
+    if use_b2d_detector_inference(args):
+        if args.auto_calibrate_vad:
+            print(
+                "[VAD Realtime] --auto_calibrate_vad is ignored for B2D detector inference; "
+                "the B2D agent calibration/pipeline is used directly.",
+                flush=True,
+            )
+            args.auto_calibrate_vad = False
+        reset_vad_temporal_state(model)
+        print(
+            "[VAD Realtime] runtime=b2d inference=full_detector "
+            "(use --b2d_direct_head to force the old direct-head path)",
+            flush=True,
+        )
     box_type_3d = import_box_type(args)
     base_meta = make_img_meta(args, cfg)
     base_meta["box_type_3d"] = box_type_3d
@@ -939,25 +1144,40 @@ def main(argv=None):
                 action = manual_action
 
             if step % max(int(args.vad_every), 1) == 0:
-                can_bus_prev_pose = None if args.no_temporal_bev else prev_pose
-                can_bus = make_can_bus(pose, can_bus_prev_pose)
-                meta = make_frame_img_meta(
-                    base_meta,
-                    can_bus,
-                    Path(args.task),
-                    step,
-                    can_bus_prev_pose is not None,
-                )
-                img_np = normalize_and_resize(images, args, cfg)
                 try:
-                    if not vad_calibrated:
-                        base_meta, next_prev_bev, latest_result, meta = auto_calibrate_vad_geometry(
-                            torch, model, img_np, pose, args, cfg, box_type_3d)
-                        vad_calibrated = True
+                    if use_b2d_detector_inference(args):
+                        next_prev_bev, latest_result, meta = run_b2d_detector_frame(
+                            torch,
+                            model,
+                            images,
+                            pose,
+                            args,
+                            cfg,
+                            box_type_3d,
+                            step,
+                            b2d_pipeline,
+                            b2d_collate,
+                        )
+                        img_np = normalize_and_resize(images, args, cfg)
                     else:
-                        vad_prev_bev = None if args.no_temporal_bev else prev_bev
-                        next_prev_bev, latest_result = run_vad_tensor(
-                            torch, model, img_np, meta, args, vad_prev_bev)
+                        can_bus_prev_pose = None if args.no_temporal_bev else prev_pose
+                        can_bus = make_can_bus(pose, can_bus_prev_pose)
+                        meta = make_frame_img_meta(
+                            base_meta,
+                            can_bus,
+                            Path(args.task),
+                            step,
+                            can_bus_prev_pose is not None,
+                        )
+                        img_np = normalize_and_resize(images, args, cfg)
+                        if not vad_calibrated:
+                            base_meta, next_prev_bev, latest_result, meta = auto_calibrate_vad_geometry(
+                                torch, model, img_np, pose, args, cfg, box_type_3d)
+                            vad_calibrated = True
+                        else:
+                            vad_prev_bev = None if args.no_temporal_bev else prev_bev
+                            next_prev_bev, latest_result = run_vad_tensor(
+                                torch, model, img_np, meta, args, vad_prev_bev)
                     prev_bev = None if args.no_temporal_bev else next_prev_bev
                     print_vad_debug(step, obs, img_np, meta, latest_result, cfg, args, pose, prev_pose)
                     prev_pose = pose
@@ -982,6 +1202,8 @@ def main(argv=None):
                 prev_bev = None
                 prev_pose = None
                 latest_result = None
+                if use_b2d_detector_inference(args):
+                    reset_vad_temporal_state(model)
                 timeout_count = 0
                 vad_calibrated = not bool(args.auto_calibrate_vad)
                 if csv_agent is not None:

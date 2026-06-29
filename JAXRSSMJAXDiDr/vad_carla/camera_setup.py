@@ -124,6 +124,63 @@ B2D_LIDAR2IMG = {
     ),
 }
 
+B2D_LIDAR2CAM = {
+    "CAM_FRONT": np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, -0.24],
+            [0.0, 1.0, 0.0, -1.19],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    ),
+    "CAM_FRONT_LEFT": np.array(
+        [
+            [0.57357644, 0.81915204, 0.0, -0.22517331],
+            [0.0, 0.0, -1.0, -0.24],
+            [-0.81915204, 0.57357644, 0.0, -0.82909407],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    ),
+    "CAM_FRONT_RIGHT": np.array(
+        [
+            [0.57357644, -0.81915204, 0.0, 0.22517331],
+            [0.0, 0.0, -1.0, -0.24],
+            [0.81915204, 0.57357644, 0.0, -0.82909407],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    ),
+    "CAM_BACK": np.array(
+        [
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, -0.24],
+            [0.0, -1.0, 0.0, -1.61],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    ),
+    "CAM_BACK_LEFT": np.array(
+        [
+            [-0.34202014, 0.93969262, 0.0, -0.25388956],
+            [0.0, 0.0, -1.0, -0.24],
+            [-0.93969262, -0.34202014, 0.0, -0.49288953],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    ),
+    "CAM_BACK_RIGHT": np.array(
+        [
+            [-0.34202014, -0.93969262, 0.0, 0.25388956],
+            [0.0, 0.0, -1.0, -0.24],
+            [0.93969262, -0.34202014, 0.0, -0.49288953],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    ),
+}
+
 DEFAULT_VAD_LIDAR_X = 0.8
 DEFAULT_VAD_LIDAR_Y = 0.0
 DEFAULT_VAD_LIDAR_Z = 2.3
@@ -406,6 +463,13 @@ def lidar2img_matrices(
         )
         for spec in iter_camera_specs(profile=profile)
     ]
+
+
+def lidar2cam_matrices(profile: str) -> list[np.ndarray]:
+    profile = normalize_camera_profile(profile)
+    if profile != "b2d":
+        raise ValueError("lidar2cam_matrices is only defined for the B2D camera profile.")
+    return [B2D_LIDAR2CAM[name].copy() for name in B2D_CAMERA_ORDER]
 
 
 def _decode_path_value(value) -> str:
