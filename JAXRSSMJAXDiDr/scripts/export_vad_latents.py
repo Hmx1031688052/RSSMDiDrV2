@@ -242,7 +242,10 @@ def make_frame_img_meta(
     has_prev: bool,
 ) -> dict:
     meta = dict(base_meta)
-    meta["can_bus"] = can_bus
+    # VAD's temporal BEV path passes can_bus[-1] directly to
+    # torchvision.transforms.functional.rotate, whose older versions reject
+    # numpy scalar angles. Keep the metadata as plain Python floats.
+    meta["can_bus"] = [float(x) for x in np.asarray(can_bus).reshape(-1)]
     meta["scene_token"] = path.stem
     meta["sample_idx"] = int(index)
     meta["prev_idx"] = int(index - 1) if has_prev else ""
