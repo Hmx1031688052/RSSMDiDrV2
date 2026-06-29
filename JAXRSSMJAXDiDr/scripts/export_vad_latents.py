@@ -134,15 +134,21 @@ def normalize_and_resize(images: np.ndarray, args: argparse.Namespace, cfg) -> n
 
 def make_img_meta(args: argparse.Namespace, cfg) -> dict:
     scale = 0.4 if args.vad_model == "tiny" else 0.8
+    scaled_h = int(args.camera_height * scale)
+    scaled_w = int(args.camera_width * scale)
+    pad_h = int(np.ceil(scaled_h / 32.0) * 32)
+    pad_w = int(np.ceil(scaled_w / 32.0) * 32)
     lidar2img = [
         lidar2img_matrix(spec, args.camera_width, args.camera_height, args.camera_fov, scale=scale)
         for spec in iter_camera_specs(VAD_CAMERA_ORDER)
     ]
     return {
         "filename": list(VAD_CAMERA_ORDER),
-        "ori_shape": [(args.camera_height, args.camera_width, 3)] * 6,
-        "img_shape": [(int(args.camera_height * scale), int(args.camera_width * scale), 3)] * 6,
-        "pad_shape": [(int(np.ceil(args.camera_height * scale / 32.0) * 32), int(np.ceil(args.camera_width * scale / 32.0) * 32), 3)] * 6,
+        # Match VAD's official pipeline after RandomScaleImageMultiViewImage
+        # and PadMultiViewImage: ori_shape is scaled, img_shape/pad_shape are padded.
+        "ori_shape": [(scaled_h, scaled_w, 3)] * 6,
+        "img_shape": [(pad_h, pad_w, 3)] * 6,
+        "pad_shape": [(pad_h, pad_w, 3)] * 6,
         "lidar2img": lidar2img,
         "can_bus": np.zeros((18,), dtype=np.float32),
         "box_type_3d": None,
@@ -194,14 +200,16 @@ def _patch_angle_deg(yaw_rad: float) -> float:
 
 
 def _ego_pose_from_chunk(chunk: Dict[str, np.ndarray], index: int) -> dict:
-    yaw = _step_scalar(chunk, "ego_yaw", index)
+    # CarDreamer/CARLA world uses x-forward, y-right. VAD/nuScenes BEV
+    # expects x-forward, y-left, so convert global y, yaw and yaw-rate here.
+    yaw = -_step_scalar(chunk, "ego_yaw", index)
     return {
         "x": _step_scalar(chunk, "ego_x", index),
-        "y": _step_scalar(chunk, "ego_y", index),
+        "y": -_step_scalar(chunk, "ego_y", index),
         "yaw": yaw,
         "patch_angle": _patch_angle_deg(yaw),
         "speed": _optional_step_scalar(chunk, "ego_speed", index),
-        "yawrate": _optional_step_scalar(chunk, "ego_yawrate", index),
+        "yawrate": -_optional_step_scalar(chunk, "ego_yawrate", index),
     }
 
 

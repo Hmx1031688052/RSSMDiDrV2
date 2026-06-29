@@ -25,7 +25,7 @@ from JAXRSSMJAXDiDr.scripts.export_vad_latents import (
     normalize_and_resize,
 )
 from JAXRSSMJAXDiDr.vad_carla import install_vad_carla_patches
-from JAXRSSMJAXDiDr.vad_carla.camera_setup import VAD_CAMERA_KEYS
+from JAXRSSMJAXDiDr.vad_carla.camera_setup import VAD_CAMERA_KEYS, VAD_CAMERA_ORDER
 
 
 def parse_args(argv=None):
@@ -47,6 +47,10 @@ def parse_args(argv=None):
     parser.add_argument("--front_width", type=int, default=640)
     parser.add_argument("--surround_width", type=int, default=960)
     parser.add_argument("--vad_every", type=int, default=1)
+    parser.add_argument("--no_temporal_bev", action="store_true")
+    parser.add_argument("--vad_debug", action="store_true")
+    parser.add_argument("--vad_debug_every", type=int, default=50)
+    parser.add_argument("--vad_debug_overlay", action="store_true")
     parser.add_argument("--max_steps", type=int, default=0, help="0 means run until q/Esc.")
     parser.add_argument("--action_acc", type=float, default=0.0)
     parser.add_argument("--action_steer", type=float, default=0.0)
@@ -147,15 +151,17 @@ def ego_pose_from_env(env) -> dict:
     tf = ego.get_transform()
     vel = ego.get_velocity()
     ang = ego.get_angular_velocity()
-    yaw = np.radians(float(tf.rotation.yaw))
+    # CARLA/CarDreamer world: x-forward, y-right. VAD/nuScenes BEV:
+    # x-forward, y-left. Convert y, yaw and yaw-rate before building can_bus.
+    yaw = -np.radians(float(tf.rotation.yaw))
     speed = float(np.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z))
     return {
         "x": float(tf.location.x),
-        "y": float(tf.location.y),
+        "y": -float(tf.location.y),
         "yaw": float(yaw),
         "patch_angle": float(np.degrees(yaw) % 360.0),
         "speed": speed,
-        "yawrate": float(np.radians(ang.z)),
+        "yawrate": -float(np.radians(ang.z)),
     }
 
 
@@ -171,6 +177,10 @@ def to_numpy(value):
 
 def run_vad_frame(torch, model, images, meta, args, cfg, prev_bev):
     img_np = normalize_and_resize(images, args, cfg)
+    return run_vad_tensor(torch, model, img_np, meta, args, prev_bev)
+
+
+def run_vad_tensor(torch, model, img_np, meta, args, prev_bev):
     img = torch.from_numpy(img_np[None]).to(args.device)
     with torch.no_grad():
         feats = model.extract_feat(img=img, img_metas=[meta])
@@ -314,6 +324,87 @@ def render_bev(result, cfg, args):
     return canvas
 
 
+def vad_image_scale(args):
+    return 0.4 if args.vad_model == "tiny" else 0.8
+
+
+def project_debug_grid(meta, cfg, args, cam_idx, nx=9, ny=17):
+    pc_range = np.asarray(getattr(cfg, "point_cloud_range", [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0]), dtype=np.float32)
+    xs = np.linspace(float(pc_range[0]), float(pc_range[3]), nx, dtype=np.float32)
+    ys = np.linspace(float(pc_range[1]), float(pc_range[4]), ny, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys)
+    pts = np.stack(
+        [xx.reshape(-1), yy.reshape(-1), np.zeros(xx.size, dtype=np.float32), np.ones(xx.size, dtype=np.float32)],
+        axis=0,
+    )
+    lidar2img = np.asarray(meta["lidar2img"][cam_idx], dtype=np.float32)
+    proj = lidar2img @ pts
+    depth = proj[2]
+    uv = proj[:2] / np.maximum(depth, 1e-6)
+    scale = vad_image_scale(args)
+    scaled_w = int(args.camera_width * scale)
+    scaled_h = int(args.camera_height * scale)
+    valid = (
+        (depth > 1e-3)
+        & (uv[0] >= 0.0)
+        & (uv[0] < float(scaled_w))
+        & (uv[1] >= 0.0)
+        & (uv[1] < float(scaled_h))
+    )
+    return uv[:, valid].T, int(valid.sum()), int(valid.size), (scaled_w, scaled_h)
+
+
+def projection_coverage_summary(meta, cfg, args):
+    items = []
+    for cam_idx, cam_name in enumerate(VAD_CAMERA_ORDER):
+        _, visible, total, _ = project_debug_grid(meta, cfg, args, cam_idx)
+        items.append(f"{cam_name}:{visible}/{total}")
+    return " ".join(items)
+
+
+def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose):
+    if not args.vad_debug:
+        return
+    interval = max(int(args.vad_debug_every), 1)
+    if step != 0 and step % interval != 0:
+        return
+
+    raw_shape = np.asarray(obs["camera_front"]).shape
+    can_bus = np.asarray(meta["can_bus"], dtype=np.float32)
+    front_raw = np.asarray(obs["camera_front"], dtype=np.float32)
+    boxes = to_numpy(result["boxes"]) if result is not None else None
+    scores = to_numpy(result["scores"]) if result is not None else None
+    map_scores = to_numpy(result["map_scores"]) if result is not None else None
+    det_count = int(np.sum(scores >= args.score_thresh)) if scores is not None else 0
+    map_count = int(np.sum(map_scores >= args.map_score_thresh)) if map_scores is not None else 0
+    total_boxes = int(len(boxes)) if boxes is not None else 0
+    total_maps = int(len(map_scores)) if map_scores is not None else 0
+    prev_flag = prev_pose is not None and not args.no_temporal_bev
+    print(
+        "[VAD Debug] "
+        f"step={step} model={args.vad_model} prev_bev={prev_flag} "
+        f"raw_front_shape={tuple(raw_shape)} tensor_shape={tuple(img_np.shape)} "
+        f"meta_ori={meta['ori_shape'][0]} meta_img={meta['img_shape'][0]} meta_pad={meta['pad_shape'][0]}",
+        flush=True,
+    )
+    print(
+        "[VAD Debug] "
+        f"front_rgb_mean={front_raw.mean(axis=(0, 1)).round(1).tolist()} "
+        f"tensor_mean={float(img_np.mean()):.2f} tensor_std={float(img_np.std()):.2f} "
+        f"can_bus_xy=({can_bus[0]:.3f},{can_bus[1]:.3f}) "
+        f"yaw_rad={can_bus[-2]:.3f} delta_yaw_deg={can_bus[-1]:.3f} "
+        f"ego=({pose['x']:.2f},{pose['y']:.2f},{np.degrees(pose['yaw']):.1f}deg)",
+        flush=True,
+    )
+    print(
+        "[VAD Debug] "
+        f"projection_grid={projection_coverage_summary(meta, cfg, args)} "
+        f"dets={det_count}/{total_boxes}@{args.score_thresh:.2f} "
+        f"maps={map_count}/{total_maps}@{args.map_score_thresh:.2f}",
+        flush=True,
+    )
+
+
 SURROUND_LAYOUT = (
     ("camera_front_left", "FRONT LEFT"),
     ("camera_front", "FRONT"),
@@ -324,7 +415,7 @@ SURROUND_LAYOUT = (
 )
 
 
-def _render_camera_tile(obs, key, label, tile_size):
+def _render_camera_tile(obs, key, label, tile_size, args=None, meta=None, cfg=None, cam_idx=None):
     import cv2
 
     if key not in obs:
@@ -333,6 +424,14 @@ def _render_camera_tile(obs, key, label, tile_size):
     image = np.asarray(obs[key])
     image = cv2.resize(image, (tile_w, tile_h))
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    if args is not None and meta is not None and cfg is not None and cam_idx is not None and args.vad_debug_overlay:
+        points, _, _, scaled_shape = project_debug_grid(meta, cfg, args, cam_idx)
+        scaled_w, scaled_h = scaled_shape
+        for u, v in points:
+            px = int(round(float(u) * tile_w / max(scaled_w, 1)))
+            py = int(round(float(v) * tile_h / max(scaled_h, 1)))
+            if 0 <= px < tile_w and 0 <= py < tile_h:
+                cv2.circle(image, (px, py), 2, (0, 255, 255), -1, cv2.LINE_AA)
     cv2.rectangle(image, (0, 0), (tile_w, 24), (0, 0, 0), -1)
     cv2.putText(
         image,
@@ -347,7 +446,7 @@ def _render_camera_tile(obs, key, label, tile_size):
     return image
 
 
-def render_surround(obs, args):
+def render_surround(obs, args, meta=None, cfg=None):
     import cv2
 
     panel_w = max(3, int(getattr(args, "surround_width", 0) or args.front_width))
@@ -356,7 +455,16 @@ def render_surround(obs, args):
     h, w = front.shape[:2]
     tile_h = max(1, int(h * tile_w / max(w, 1)))
     tiles = [
-        _render_camera_tile(obs, key, label, (tile_w, tile_h))
+        _render_camera_tile(
+            obs,
+            key,
+            label,
+            (tile_w, tile_h),
+            args=args,
+            meta=meta,
+            cfg=cfg,
+            cam_idx=VAD_CAMERA_KEYS.index(key) if key in VAD_CAMERA_KEYS else None,
+        )
         for key, label in SURROUND_LAYOUT
     ]
     top = np.concatenate(tiles[:3], axis=1)
@@ -668,9 +776,20 @@ def main(argv=None):
 
             if step % max(int(args.vad_every), 1) == 0:
                 can_bus = make_can_bus(pose, prev_pose)
-                meta = make_frame_img_meta(base_meta, can_bus, Path(args.task), step, prev_pose is not None)
+                meta = make_frame_img_meta(
+                    base_meta,
+                    can_bus,
+                    Path(args.task),
+                    step,
+                    prev_pose is not None and not args.no_temporal_bev,
+                )
+                img_np = normalize_and_resize(images, args, cfg)
                 try:
-                    prev_bev, latest_result = run_vad_frame(torch, model, images, meta, args, cfg, prev_bev)
+                    vad_prev_bev = None if args.no_temporal_bev else prev_bev
+                    next_prev_bev, latest_result = run_vad_tensor(
+                        torch, model, img_np, meta, args, vad_prev_bev)
+                    prev_bev = None if args.no_temporal_bev else next_prev_bev
+                    print_vad_debug(step, obs, img_np, meta, latest_result, cfg, args, pose, prev_pose)
                     prev_pose = pose
                 except Exception as exc:
                     cv2.destroyAllWindows()
@@ -679,7 +798,7 @@ def main(argv=None):
                         "and whether this model requires extra planning inputs."
                     ) from exc
 
-            surround = render_surround(obs, args)
+            surround = render_surround(obs, args, meta=base_meta, cfg=cfg)
             bev = render_bev(latest_result, cfg, args)
             cv2.imshow(args.window, make_visual(surround, bev))
             key = cv2.waitKey(1) & 0xFF
