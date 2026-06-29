@@ -26,21 +26,30 @@ from JAXRSSMJAXDiDr.scripts.export_vad_latents import (
     make_frame_img_meta,
     make_img_meta,
     normalize_and_resize,
+    normalize_vad_runtime_args,
 )
 from JAXRSSMJAXDiDr.vad_carla import install_vad_carla_patches
-from JAXRSSMJAXDiDr.vad_carla.camera_setup import VAD_CAMERA_KEYS, VAD_CAMERA_ORDER
+from JAXRSSMJAXDiDr.vad_carla.camera_setup import get_camera_keys, get_camera_order
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", default="carla_roundabout")
+    parser.add_argument("--vad_runtime", choices=("official", "b2d"), default="b2d")
     parser.add_argument("--vad_root", default=str(ROOT / "VAD"))
     parser.add_argument("--vad_model", choices=("tiny", "base"), default="tiny")
     parser.add_argument("--vad_checkpoint", required=True)
+    parser.add_argument("--checkpoint_strict", action="store_true")
+    parser.add_argument(
+        "--b2d_root",
+        default=str(ROOT / "Bench2DriveZoo-uniad-vad" / "Bench2DriveZoo-uniad-vad"),
+    )
+    parser.add_argument("--b2d_config", default="adzoo/vad/configs/VAD/VAD_base_e2e_b2d.py")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--camera_width", type=int, default=1600)
     parser.add_argument("--camera_height", type=int, default=900)
     parser.add_argument("--camera_fov", type=float, default=70.0)
+    parser.add_argument("--camera_profile", choices=("nusc", "b2d"), default="b2d")
     parser.add_argument("--vad_lidar_x", type=float, default=DEFAULT_VAD_LIDAR_X)
     parser.add_argument("--vad_lidar_y", type=float, default=DEFAULT_VAD_LIDAR_Y)
     parser.add_argument("--vad_lidar_z", type=float, default=DEFAULT_VAD_LIDAR_Z)
@@ -48,11 +57,15 @@ def parse_args(argv=None):
     parser.add_argument("--calib_lidar_x_values", default="0.0,0.4,0.8,1.0,1.2")
     parser.add_argument("--calib_lidar_z_values", default="1.8,2.0,2.3,2.5,2.7")
     parser.add_argument("--sensor_tick", type=float, default=0.1)
-    parser.add_argument("--pretrained_norm", action="store_true", default=True)
+    parser.add_argument(
+        "--pretrained_norm",
+        action="store_true",
+        default=False,
+        help="Use the legacy BGR/std=1 normalization path instead of cfg.img_norm_cfg.",
+    )
     parser.add_argument("--no_pretrained_norm", dest="pretrained_norm", action="store_false")
     parser.add_argument("--score_thresh", type=float, default=0.35)
     parser.add_argument("--map_score_thresh", type=float, default=0.35)
-    parser.add_argument("--ego_cmd", choices=("none", "right", "left", "straight", "all"), default="none")
     parser.add_argument("--bev_size", type=int, default=640)
     parser.add_argument("--front_width", type=int, default=640)
     parser.add_argument("--surround_width", type=int, default=960)
@@ -141,7 +154,12 @@ def reset_ros2_expert(bridge, speed_pid):
     bridge.send_reset()
 
 
-def import_box_type():
+def import_box_type(args):
+    if getattr(args, "vad_runtime", "official") == "b2d":
+        from mmcv.core.bbox import get_box_type
+
+        box_type_3d, _ = get_box_type("LiDAR")
+        return box_type_3d
     try:
         from mmdet3d.core import LiDARInstance3DBoxes
     except Exception:
@@ -149,17 +167,19 @@ def import_box_type():
     return LiDARInstance3DBoxes
 
 
-def stack_vad_images(obs: Dict[str, np.ndarray]) -> np.ndarray:
-    missing = [key for key in VAD_CAMERA_KEYS if key not in obs]
+def stack_vad_images(obs: Dict[str, np.ndarray], args) -> np.ndarray:
+    camera_keys = get_camera_keys(args.camera_profile)
+    missing = [key for key in camera_keys if key not in obs]
     if missing:
         raise KeyError(f"Observation is missing VAD camera keys: {missing}")
-    return np.stack([np.asarray(obs[key]) for key in VAD_CAMERA_KEYS], axis=0)
+    return np.stack([np.asarray(obs[key]) for key in camera_keys], axis=0)
 
 
 def ego_pose_from_env(env) -> dict:
     ego = env.get_ego_vehicle() if hasattr(env, "get_ego_vehicle") else env.ego
     tf = ego.get_transform()
     vel = ego.get_velocity()
+    acc = ego.get_acceleration()
     ang = ego.get_angular_velocity()
     # CARLA/CarDreamer world: x-forward, y-right. VAD/nuScenes BEV:
     # x-forward, y-left. Convert y, yaw and yaw-rate before building can_bus.
@@ -173,6 +193,12 @@ def ego_pose_from_env(env) -> dict:
         "speed": speed,
         "vx": float(vel.x),
         "vy": -float(vel.y),
+        "acceleration": [float(acc.x), -float(acc.y), float(acc.z)],
+        "angular_velocity": [
+            -float(np.radians(ang.x)),
+            float(np.radians(ang.y)),
+            -float(np.radians(ang.z)),
+        ],
         "yawrate": -float(np.radians(ang.z)),
     }
 
@@ -198,7 +224,8 @@ def run_vad_tensor(torch, model, img_np, meta, args, prev_bev):
         feats = model.extract_feat(img=img, img_metas=[meta])
         outs = model.pts_bbox_head(feats, [meta], prev_bev=prev_bev)
         bbox_list = model.pts_bbox_head.get_bboxes(outs, [meta], rescale=False)
-    return outs.get("bev_embed"), decode_bbox_list(bbox_list[0], outs)
+    result = decode_bbox_list(bbox_list[0], outs)
+    return result["bev_embed"], result
 
 
 def decode_bbox_list(item, outs):
@@ -219,7 +246,8 @@ def decode_bbox_list(item, outs):
         "map_scores": map_scores,
         "map_labels": map_labels,
         "map_pts": map_pts,
-        "ego_fut_preds": outs.get("ego_fut_preds"),
+        # Perception latent for downstream planners. VAD returns [HW, B, D].
+        "bev_embed": outs.get("bev_embed"),
     }
 
 
@@ -227,7 +255,8 @@ def point_to_bev(point, pc_range, size):
     x_min, y_min = float(pc_range[0]), float(pc_range[1])
     x_max, y_max = float(pc_range[3]), float(pc_range[4])
     x, y = float(point[0]), float(point[1])
-    px = int((y - y_min) / max(y_max - y_min, 1e-6) * (size - 1))
+    # x-forward -> image upward; y-left -> image leftward.
+    px = int((y_max - y) / max(y_max - y_min, 1e-6) * (size - 1))
     py = int((x_max - x) / max(x_max - x_min, 1e-6) * (size - 1))
     return px, py
 
@@ -265,45 +294,24 @@ def draw_agent_trajs(canvas, center, trajs, pc_range, color):
     trajs = np.asarray(trajs, dtype=np.float32)
     if trajs.size == 0:
         return
+
+    # [12] -> [1, 6, 2]
     if trajs.ndim == 1:
         trajs = trajs.reshape(1, -1, 2)
+
+    # [6, 12] -> [6, 6, 2]; [T, 2] -> [1, T, 2]
     elif trajs.ndim == 2:
-        trajs = trajs[None]
+        if trajs.shape[-1] == 2:
+            trajs = trajs[None]
+        else:
+            trajs = trajs.reshape(trajs.shape[0], -1, 2)
+    elif trajs.ndim != 3:
+        return
+
     for mode in trajs[:3]:
-        pts = np.cumsum(mode.reshape(-1, 2), axis=0) + np.asarray(center[:2], dtype=np.float32)
+        pts = np.cumsum(mode, axis=0)
+        pts += np.asarray(center[:2], dtype=np.float32)
         draw_polyline(canvas, pts, pc_range, color, thickness=1)
-
-
-EGO_CMD_TO_INDEX = {
-    "right": 0,
-    "left": 1,
-    "straight": 2,
-}
-
-
-def draw_ego_plan(canvas, ego_fut, pc_range, args):
-    if args.ego_cmd == "none":
-        return
-    plans = np.asarray(ego_fut, dtype=np.float32)
-    if plans.ndim >= 4:
-        plans = plans[0]
-    if plans.size == 0:
-        return
-    colors = {
-        "right": (35, 90, 255),
-        "left": (255, 80, 80),
-        "straight": (60, 150, 60),
-    }
-    if args.ego_cmd == "all":
-        for name, idx in EGO_CMD_TO_INDEX.items():
-            if idx < len(plans):
-                pts = np.cumsum(plans[idx].reshape(-1, 2), axis=0)
-                draw_polyline(canvas, pts, pc_range, colors[name], thickness=2)
-        return
-    idx = EGO_CMD_TO_INDEX[args.ego_cmd]
-    if idx < len(plans):
-        pts = np.cumsum(plans[idx].reshape(-1, 2), axis=0)
-        draw_polyline(canvas, pts, pc_range, colors[args.ego_cmd], thickness=2)
 
 
 def render_bev(result, cfg, args):
@@ -355,10 +363,6 @@ def render_bev(result, cfg, args):
                 if trajs is not None and idx < len(trajs):
                     draw_agent_trajs(canvas, box[:2], trajs[idx], pc_range, (220, 120, 20))
 
-        ego_fut = to_numpy(result["ego_fut_preds"])
-        if ego_fut is not None:
-            draw_ego_plan(canvas, ego_fut, pc_range, args)
-
     ego_px = point_to_bev((0.0, 0.0), pc_range, size)
     cv2.circle(canvas, ego_px, 5, (0, 0, 0), -1)
     cv2.putText(canvas, "BEV x-forward y-left", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 30, 30), 1)
@@ -366,6 +370,8 @@ def render_bev(result, cfg, args):
 
 
 def vad_image_scale(args):
+    if getattr(args, "vad_runtime", "official") == "b2d":
+        return 0.8
     return 0.4 if args.vad_model == "tiny" else 0.8
 
 
@@ -402,7 +408,7 @@ def project_debug_grid(meta, cfg, args, cam_idx, nx=9, ny=17):
 
 def projection_coverage_summary(meta, cfg, args):
     items = []
-    for cam_idx, cam_name in enumerate(VAD_CAMERA_ORDER):
+    for cam_idx, cam_name in enumerate(get_camera_order(args.camera_profile)):
         _, visible, total, _ = project_debug_grid(meta, cfg, args, cam_idx)
         items.append(f"{cam_name}:{visible}/{total}")
     return " ".join(items)
@@ -421,6 +427,9 @@ def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose)
     boxes = to_numpy(result["boxes"]) if result is not None else None
     scores = to_numpy(result["scores"]) if result is not None else None
     map_scores = to_numpy(result["map_scores"]) if result is not None else None
+    bev_embed = result.get("bev_embed") if result is not None else None
+    bev_shape = tuple(bev_embed.shape) if bev_embed is not None and hasattr(bev_embed, "shape") else None
+    norm_mode = "legacy_bgr_std1" if args.pretrained_norm else "config_img_norm_cfg"
     det_count = int(np.sum(scores >= args.score_thresh)) if scores is not None else 0
     map_count = int(np.sum(map_scores >= args.map_score_thresh)) if map_scores is not None else 0
     total_boxes = int(len(boxes)) if boxes is not None else 0
@@ -435,6 +444,7 @@ def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose)
     print(
         "[VAD Debug] "
         f"step={step} model={args.vad_model} prev_bev={prev_flag} "
+        f"profile={args.camera_profile} norm={norm_mode} bev_shape={bev_shape} "
         f"vad_lidar=({args.vad_lidar_x:.2f},{args.vad_lidar_y:.2f},{args.vad_lidar_z:.2f}) "
         f"raw_front_shape={tuple(raw_shape)} tensor_shape={tuple(img_np.shape)} "
         f"meta_ori={meta['ori_shape'][0]} meta_img={meta['img_shape'][0]} meta_pad={meta['pad_shape'][0]}",
@@ -445,6 +455,7 @@ def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose)
         f"front_rgb_mean={front_raw.mean(axis=(0, 1)).round(1).tolist()} "
         f"tensor_mean={float(img_np.mean()):.2f} tensor_std={float(img_np.std()):.2f} "
         f"can_bus_xy=({can_bus[0]:.3f},{can_bus[1]:.3f}) "
+        f"speed={can_bus[7]:.3f} ang_vel={can_bus[13:16].round(3).tolist()} "
         f"yaw_rad={can_bus[-2]:.3f} delta_yaw_deg={can_bus[-1]:.3f} "
         f"ego=({pose['x']:.2f},{pose['y']:.2f},{np.degrees(pose['yaw']):.1f}deg)",
         flush=True,
@@ -592,6 +603,7 @@ def _render_camera_tile(obs, key, label, tile_size, args=None, meta=None, cfg=No
 def render_surround(obs, args, meta=None, cfg=None):
     import cv2
 
+    camera_keys = get_camera_keys(args.camera_profile)
     panel_w = max(3, int(getattr(args, "surround_width", 0) or args.front_width))
     tile_w = max(1, panel_w // 3)
     front = np.asarray(obs["camera_front"])
@@ -606,7 +618,7 @@ def render_surround(obs, args, meta=None, cfg=None):
             args=args,
             meta=meta,
             cfg=cfg,
-            cam_idx=VAD_CAMERA_KEYS.index(key) if key in VAD_CAMERA_KEYS else None,
+            cam_idx=camera_keys.index(key) if key in camera_keys else None,
         )
         for key, label in SURROUND_LAYOUT
     ]
@@ -860,6 +872,7 @@ def ros2_expert_action(cp, rclpy, bridge, speed_pid, env, args, timeout_count):
 
 def main(argv=None):
     args, rest = parse_args(argv)
+    args = normalize_vad_runtime_args(args)
 
     install_vad_carla_patches(
         task=args.task,
@@ -868,15 +881,22 @@ def main(argv=None):
         fov=args.camera_fov,
         sensor_tick=args.sensor_tick,
         include_birdeye=True,
+        camera_profile=args.camera_profile,
     )
 
     import cv2
     import car_dreamer
 
     torch, model, cfg = build_vad(args)
-    box_type_3d = import_box_type()
+    box_type_3d = import_box_type(args)
     base_meta = make_img_meta(args, cfg)
     base_meta["box_type_3d"] = box_type_3d
+    print(
+        "[VAD Realtime] "
+        f"camera_profile={args.camera_profile} "
+        f"camera_order={', '.join(get_camera_order(args.camera_profile))}",
+        flush=True,
+    )
 
     env, _ = car_dreamer.create_task(args.task, rest)
     obs = env.reset()
@@ -906,7 +926,7 @@ def main(argv=None):
     cv2.namedWindow(args.window, cv2.WINDOW_NORMAL)
     try:
         while args.max_steps <= 0 or step < args.max_steps:
-            images = stack_vad_images(obs)
+            images = stack_vad_images(obs, args)
             pose = ego_pose_from_env(env)
 
             if csv_agent is not None:
@@ -945,7 +965,7 @@ def main(argv=None):
                     cv2.destroyAllWindows()
                     raise RuntimeError(
                         "VAD realtime inference failed. Check checkpoint/config compatibility "
-                        "and whether this model requires extra planning inputs."
+                        "and the CARLA camera/calibration/meta input contract."
                     ) from exc
 
             surround = render_surround(obs, args, meta=base_meta, cfg=cfg)

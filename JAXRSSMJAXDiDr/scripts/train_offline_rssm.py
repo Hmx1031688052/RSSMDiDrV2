@@ -62,6 +62,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         action="store_true",
         help="Use structured ego/neighbor/route observations only, disabling BEV image encoder/decoder keys.",
     )
+    parser.add_argument(
+        "--vad_world_model",
+        action="store_true",
+        help="Train the RSSM only on a compact VAD perception latent such as `vad_scene_latent`.",
+    )
+    parser.add_argument("--vad_obs_key", default="vad_scene_latent")
     return parser.parse_known_args()
 
 
@@ -99,7 +105,20 @@ def build_config(args: argparse.Namespace, extra: list[str], create_env: bool = 
         "dreamerv3.replay_size": int(args.replay_size),
         "dreamerv3.run.from_checkpoint": args.from_checkpoint,
     }
-    if getattr(args, "structured_world_model", False):
+    if getattr(args, "vad_world_model", False) and getattr(args, "structured_world_model", False):
+        raise ValueError("Use only one of --vad_world_model or --structured_world_model.")
+    if getattr(args, "vad_world_model", False):
+        vad_key = str(getattr(args, "vad_obs_key", "vad_scene_latent"))
+        updates.update(
+            {
+                "dreamerv3.encoder.cnn_keys": "none",
+                "dreamerv3.decoder.cnn_keys": "none",
+                "dreamerv3.encoder.mlp_keys": vad_key,
+                "dreamerv3.decoder.mlp_keys": vad_key,
+                "dreamerv3.run.log_keys_video": ["none"],
+            }
+        )
+    elif getattr(args, "structured_world_model", False):
         structured_keys = (
             "ego_.*|neighbor_vehicles_local|route_waypoints8|global_path_ego|"
             "global_path_ego_mask|target_region|route_remaining"

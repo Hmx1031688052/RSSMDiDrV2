@@ -25,9 +25,8 @@ from JAXRSSMJAXDiDr.vad_carla.camera_setup import (
     DEFAULT_VAD_LIDAR_Y,
     DEFAULT_VAD_LIDAR_Z,
     VAD_CAMERA_KEYS,
-    VAD_CAMERA_ORDER,
-    iter_camera_specs,
-    lidar2img_matrix,
+    get_camera_order,
+    lidar2img_matrices,
     select_camera_arrays,
 )
 
@@ -36,12 +35,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--replay_dir", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--vad_runtime", choices=("official", "b2d"), default="b2d")
     parser.add_argument("--vad_root", default=str(ROOT / "VAD"))
     parser.add_argument("--vad_model", choices=("tiny", "base"), default="tiny")
     parser.add_argument("--vad_checkpoint", required=True)
+    parser.add_argument("--checkpoint_strict", action="store_true")
+    parser.add_argument(
+        "--b2d_root",
+        default=str(ROOT / "Bench2DriveZoo-uniad-vad" / "Bench2DriveZoo-uniad-vad"),
+    )
+    parser.add_argument("--b2d_config", default="adzoo/vad/configs/VAD/VAD_base_e2e_b2d.py")
     parser.add_argument("--camera_width", type=int, default=1600)
     parser.add_argument("--camera_height", type=int, default=900)
     parser.add_argument("--camera_fov", type=float, default=70.0)
+    parser.add_argument("--camera_profile", choices=("nusc", "b2d"), default="b2d")
     parser.add_argument("--vad_lidar_x", type=float, default=DEFAULT_VAD_LIDAR_X)
     parser.add_argument("--vad_lidar_y", type=float, default=DEFAULT_VAD_LIDAR_Y)
     parser.add_argument("--vad_lidar_z", type=float, default=DEFAULT_VAD_LIDAR_Z)
@@ -53,7 +60,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated components for output_key. Choices: bev, agent, map, ego. "
         "Use 'bev' to reproduce the earlier BEV-only latent.",
     )
-    parser.add_argument("--pretrained_norm", action="store_true", default=True)
+    parser.add_argument(
+        "--pretrained_norm",
+        action="store_true",
+        default=False,
+        help="Use the legacy BGR/std=1 normalization path instead of cfg.img_norm_cfg.",
+    )
     parser.add_argument("--no_pretrained_norm", dest="pretrained_norm", action="store_false")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--limit_chunks", type=int, default=0)
@@ -93,6 +105,66 @@ def import_vad_runtime(vad_root: Path):
         sys.path.insert(0, str(plugin_dir.parent))
     importlib.import_module("projects.mmdet3d_plugin")
     return torch, Config, load_checkpoint, build_model
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def import_b2d_vad_runtime(b2d_root: Path):
+    """Import Bench2DriveZoo's local mmcv fork before any other mmcv package."""
+
+    b2d_root = b2d_root.resolve()
+    if not b2d_root.is_dir():
+        raise FileNotFoundError(f"Bench2DriveZoo root does not exist: {b2d_root}")
+
+    existing_mmcv = sys.modules.get("mmcv")
+    if existing_mmcv is not None:
+        mmcv_file = getattr(existing_mmcv, "__file__", None)
+        if mmcv_file is None or not _path_is_relative_to(Path(mmcv_file), b2d_root):
+            raise RuntimeError(
+                "B2D VAD runtime must be selected in a fresh Python process before "
+                "official VAD/mmcv is imported. Restart and use --vad_runtime b2d."
+            )
+
+    if str(b2d_root) not in sys.path:
+        sys.path.insert(0, str(b2d_root))
+
+    import torch
+    from mmcv import Config
+    from mmcv.models import build_model
+    from mmcv.utils import load_checkpoint
+
+    importlib.import_module("mmcv.models")
+    return torch, Config, load_checkpoint, build_model
+
+
+def resolve_b2d_config(args: argparse.Namespace) -> Path:
+    config_path = Path(args.b2d_config)
+    if not config_path.is_absolute():
+        config_path = Path(args.b2d_root) / config_path
+    return config_path.resolve()
+
+
+def normalize_vad_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
+    if getattr(args, "vad_runtime", "official") == "b2d":
+        if getattr(args, "camera_profile", "nusc") != "b2d":
+            print("[vad_runtime] B2D runtime uses the B2D camera profile; overriding --camera_profile b2d.", flush=True)
+            args.camera_profile = "b2d"
+        if getattr(args, "vad_model", "tiny") != "base":
+            print("[vad_runtime] B2D VAD checkpoint is base-scale; overriding --vad_model base.", flush=True)
+            args.vad_model = "base"
+    return args
+
+
+def vad_image_scale(args: argparse.Namespace) -> float:
+    if getattr(args, "vad_runtime", "official") == "b2d":
+        return 0.8
+    return 0.4 if args.vad_model == "tiny" else 0.8
 
 
 def _checkpoint_state_dict(checkpoint):
@@ -136,6 +208,31 @@ def print_checkpoint_summary(model, checkpoint, args) -> None:
 
 
 def build_vad(args: argparse.Namespace):
+    args = normalize_vad_runtime_args(args)
+    if getattr(args, "vad_runtime", "official") == "b2d":
+        b2d_root = Path(args.b2d_root)
+        torch, Config, load_checkpoint, build_model = import_b2d_vad_runtime(b2d_root)
+        config_path = resolve_b2d_config(args)
+        cfg = Config.fromfile(str(config_path))
+        if "pretrained" in cfg.model:
+            cfg.model.pretrained = None
+        model = build_model(cfg.model, train_cfg=cfg.get("train_cfg"), test_cfg=cfg.get("test_cfg"))
+        checkpoint = load_checkpoint(
+            model,
+            args.vad_checkpoint,
+            map_location="cpu",
+            strict=bool(getattr(args, "checkpoint_strict", False)),
+        )
+        print_checkpoint_summary(model, checkpoint, args)
+        model.to(args.device)
+        model.eval()
+        print(
+            f"[VAD Build] runtime=b2d config={config_path} "
+            f"checkpoint_strict={bool(getattr(args, 'checkpoint_strict', False))}",
+            flush=True,
+        )
+        return torch, model, cfg
+
     vad_root = Path(args.vad_root)
     torch, Config, load_checkpoint, build_model = import_vad_runtime(vad_root)
     config_name = "VAD_tiny_stage_2.py" if args.vad_model == "tiny" else "VAD_base_stage_2.py"
@@ -152,11 +249,11 @@ def build_vad(args: argparse.Namespace):
 def normalize_and_resize(images: np.ndarray, args: argparse.Namespace, cfg) -> np.ndarray:
     import cv2
 
-    scale = 0.4 if args.vad_model == "tiny" else 0.8
+    scale = vad_image_scale(args)
     out = []
     if args.pretrained_norm:
-        # VAD docs note that released checkpoints were trained with this BGR,
-        # std=1 normalization. CARLA CameraHandler returns RGB, so flip first.
+        # Legacy compatibility path. The local VAD configs use img_norm_cfg by
+        # default, which is the safer choice for VAD base/tiny checkpoints here.
         mean = np.asarray([103.530, 116.280, 123.675], dtype=np.float32)
         std = np.asarray([1.0, 1.0, 1.0], dtype=np.float32)
         to_bgr = True
@@ -180,26 +277,25 @@ def normalize_and_resize(images: np.ndarray, args: argparse.Namespace, cfg) -> n
 
 
 def make_img_meta(args: argparse.Namespace, cfg) -> dict:
-    scale = 0.4 if args.vad_model == "tiny" else 0.8
+    camera_profile = getattr(args, "camera_profile", "nusc")
+    camera_order = get_camera_order(camera_profile)
+    scale = vad_image_scale(args)
     scaled_h = int(args.camera_height * scale)
     scaled_w = int(args.camera_width * scale)
     pad_h = int(np.ceil(scaled_h / 32.0) * 32)
     pad_w = int(np.ceil(scaled_w / 32.0) * 32)
-    lidar2img = [
-        lidar2img_matrix(
-            spec,
-            args.camera_width,
-            args.camera_height,
-            args.camera_fov,
-            scale=scale,
-            lidar_x=float(getattr(args, "vad_lidar_x", DEFAULT_VAD_LIDAR_X)),
-            lidar_y=float(getattr(args, "vad_lidar_y", DEFAULT_VAD_LIDAR_Y)),
-            lidar_z=float(getattr(args, "vad_lidar_z", DEFAULT_VAD_LIDAR_Z)),
-        )
-        for spec in iter_camera_specs(VAD_CAMERA_ORDER)
-    ]
+    lidar2img = lidar2img_matrices(
+        camera_profile,
+        args.camera_width,
+        args.camera_height,
+        args.camera_fov,
+        scale=scale,
+        lidar_x=float(getattr(args, "vad_lidar_x", DEFAULT_VAD_LIDAR_X)),
+        lidar_y=float(getattr(args, "vad_lidar_y", DEFAULT_VAD_LIDAR_Y)),
+        lidar_z=float(getattr(args, "vad_lidar_z", DEFAULT_VAD_LIDAR_Z)),
+    )
     return {
-        "filename": list(VAD_CAMERA_ORDER),
+        "filename": list(camera_order),
         # Match VAD's official pipeline after RandomScaleImageMultiViewImage
         # and PadMultiViewImage: ori_shape is scaled, img_shape/pad_shape are padded.
         "ori_shape": [(scaled_h, scaled_w, 3)] * 6,
@@ -269,6 +365,16 @@ def _ego_pose_from_chunk(chunk: Dict[str, np.ndarray], index: int) -> dict:
         "yaw": yaw,
         "patch_angle": _patch_angle_deg(yaw),
         "speed": _optional_step_scalar(chunk, "ego_speed", index),
+        "acceleration": [
+            _optional_step_scalar(chunk, "ego_accel_x", index),
+            -_optional_step_scalar(chunk, "ego_accel_y", index),
+            _optional_step_scalar(chunk, "ego_accel_z", index),
+        ],
+        "angular_velocity": [
+            0.0,
+            0.0,
+            -_optional_step_scalar(chunk, "ego_yawrate", index),
+        ],
         "yawrate": -_optional_step_scalar(chunk, "ego_yawrate", index),
     }
 
@@ -295,9 +401,15 @@ def make_can_bus(cur_pose: dict, prev_pose: dict | None) -> np.ndarray:
         [np.cos(half_yaw), 0.0, 0.0, np.sin(half_yaw)],
         dtype=np.float32,
     )
-    can_bus[12] = float(cur_pose["yawrate"])
-    can_bus[13] = float(cur_pose.get("vx", cur_pose["speed"] * np.cos(yaw)))
-    can_bus[14] = float(cur_pose.get("vy", cur_pose["speed"] * np.sin(yaw)))
+    can_bus[7] = float(cur_pose.get("speed", 0.0))
+    if "acceleration" in cur_pose:
+        can_bus[10:13] = np.asarray(cur_pose["acceleration"], dtype=np.float32).reshape(3)
+    elif "yawrate" in cur_pose:
+        can_bus[12] = float(cur_pose["yawrate"])
+    if "angular_velocity" in cur_pose:
+        can_bus[13:16] = np.asarray(cur_pose["angular_velocity"], dtype=np.float32).reshape(3)
+    elif "yawrate" in cur_pose:
+        can_bus[15] = float(cur_pose["yawrate"])
     can_bus[-2] = float(np.radians(cur_pose["patch_angle"]))
     return can_bus
 
@@ -342,6 +454,22 @@ def latent_components_arg(value: str) -> tuple[str, ...]:
     if not components:
         raise ValueError("At least one latent component is required.")
     return components
+
+
+def pool_vad_token_dict(token_dict: Dict[str, object], args: argparse.Namespace) -> np.ndarray:
+    pooled = []
+    for name in latent_components_arg(args.latent_components):
+        value = token_dict[name]
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        pooled.append(pool_tokens(np.asarray(value), args.pool))
+    return np.concatenate(pooled, axis=0).astype(np.float32)
+
+
+def vad_scene_latent_dim(model, args: argparse.Namespace) -> int:
+    embed_dims = int(getattr(model.pts_bbox_head, "embed_dims", 256))
+    stat_multiplier = 2 if args.pool == "mean_std" else 1
+    return embed_dims * stat_multiplier * len(latent_components_arg(args.latent_components))
 
 
 def extract_vad_tokens(torch, model, feats, img_metas, prev_bev):
@@ -393,6 +521,15 @@ def extract_vad_tokens(torch, model, feats, img_metas, prev_bev):
     }, bev_tokens
 
 
+def extract_vad_scene_latent(torch, model, images, meta, args, cfg, prev_bev):
+    img_np = normalize_and_resize(images, args, cfg)
+    img = torch.from_numpy(img_np[None]).to(args.device)
+    with torch.no_grad():
+        feats = model.extract_feat(img=img, img_metas=[meta])
+        token_dict, next_bev = extract_vad_tokens(torch, model, feats, [meta], prev_bev)
+    return pool_vad_token_dict(token_dict, args), next_bev
+
+
 def export_chunk(path: Path, out_path: Path, torch, model, cfg, args: argparse.Namespace) -> None:
     chunk = load_npz(path)
     length = len(chunk["action"]) if "action" in chunk else len(next(iter(chunk.values())))
@@ -400,7 +537,6 @@ def export_chunk(path: Path, out_path: Path, torch, model, cfg, args: argparse.N
     prev_bev = None
     prev_pose = None
     base_meta = make_img_meta(args, cfg)
-    components = latent_components_arg(args.latent_components)
     with torch.no_grad():
         for index in range(length):
             if _is_sequence_start(chunk, index):
@@ -410,16 +546,12 @@ def export_chunk(path: Path, out_path: Path, torch, model, cfg, args: argparse.N
             cur_pose = _ego_pose_from_chunk(chunk, index)
             can_bus = make_can_bus(cur_pose, prev_pose)
             meta = make_frame_img_meta(base_meta, can_bus, path, index, prev_pose is not None)
-            images = select_camera_arrays(chunk, index)
+            images = select_camera_arrays(chunk, index, profile=getattr(args, "camera_profile", "nusc"))
             img_np = normalize_and_resize(images, args, cfg)
             img = torch.from_numpy(img_np[None]).to(args.device)
             feats = model.extract_feat(img=img, img_metas=[meta])
             token_dict, prev_bev = extract_vad_tokens(torch, model, feats, [meta], prev_bev)
-            pooled = [
-                pool_tokens(token_dict[name].detach().cpu().numpy(), args.pool)
-                for name in components
-            ]
-            latents.append(np.concatenate(pooled, axis=0).astype(np.float32))
+            latents.append(pool_vad_token_dict(token_dict, args))
             prev_pose = cur_pose
     chunk[args.output_key] = np.stack(latents, axis=0).astype(np.float32)
     save_npz(out_path, chunk)
@@ -427,6 +559,7 @@ def export_chunk(path: Path, out_path: Path, torch, model, cfg, args: argparse.N
 
 def main() -> None:
     args = parse_args()
+    args = normalize_vad_runtime_args(args)
     replay_dir = Path(args.replay_dir)
     output_dir = Path(args.output_dir)
     paths = sorted(replay_dir.glob("*.npz"))
@@ -438,7 +571,8 @@ def main() -> None:
     torch, model, cfg = build_vad(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[vad_export] model={args.vad_model} checkpoint={args.vad_checkpoint}")
-    print(f"[vad_export] cameras={', '.join(VAD_CAMERA_ORDER)}")
+    print(f"[vad_export] camera_profile={args.camera_profile} cameras={', '.join(get_camera_order(args.camera_profile))}")
+    print(f"[vad_export] norm={'legacy_bgr_std1' if args.pretrained_norm else 'config_img_norm_cfg'}")
     print(f"[vad_export] latent_components={args.latent_components} pool={args.pool}")
     for idx, path in enumerate(paths, 1):
         out_path = output_dir / path.name

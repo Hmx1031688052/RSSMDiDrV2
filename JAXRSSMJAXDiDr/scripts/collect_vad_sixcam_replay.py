@@ -46,6 +46,7 @@ def parse_args(argv=None):
     parser.add_argument("--vad_camera_width", type=int, default=1600)
     parser.add_argument("--vad_camera_height", type=int, default=900)
     parser.add_argument("--vad_camera_fov", type=float, default=70.0)
+    parser.add_argument("--vad_camera_profile", choices=("nusc", "b2d"), default="b2d")
     parser.add_argument("--vad_sensor_tick", type=float, default=0.1)
     parser.add_argument("--vad_replay_chunks", type=int, default=1024)
     parser.add_argument("--vad_replay_size", type=int, default=1)
@@ -82,6 +83,7 @@ def main(argv=None) -> None:
         fov=args.vad_camera_fov,
         sensor_tick=args.vad_sensor_tick,
         include_birdeye=not args.vad_no_birdeye,
+        camera_profile=args.vad_camera_profile,
     )
     if "--task" not in rest:
         rest = ["--task", args.task, *rest]
@@ -100,8 +102,7 @@ def main(argv=None) -> None:
 
     collect_polyplanner = load_collect_polyplanner()
 
-    print("[vad_collect] Enabled VAD camera keys in nuScenes order:")
-    print("[vad_collect] CAM_FRONT, CAM_FRONT_RIGHT, CAM_FRONT_LEFT, CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT")
+    print(f"[vad_collect] Enabled VAD camera profile: {args.vad_camera_profile}")
     print(
         "[vad_collect] camera="
         f"{args.vad_camera_width}x{args.vad_camera_height} fov={args.vad_camera_fov} tick={args.vad_sensor_tick}"
