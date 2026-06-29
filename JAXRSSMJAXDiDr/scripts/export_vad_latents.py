@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera_width", type=int, default=1600)
     parser.add_argument("--camera_height", type=int, default=900)
     parser.add_argument("--camera_fov", type=float, default=70.0)
+    parser.add_argument("--vad_lidar_x", type=float, default=0.0)
+    parser.add_argument("--vad_lidar_y", type=float, default=0.0)
+    parser.add_argument("--vad_lidar_z", type=float, default=2.0)
     parser.add_argument("--output_key", default="vad_scene_latent")
     parser.add_argument("--pool", choices=("mean", "mean_std"), default="mean_std")
     parser.add_argument(
@@ -89,6 +92,46 @@ def import_vad_runtime(vad_root: Path):
     return torch, Config, load_checkpoint, build_model
 
 
+def _checkpoint_state_dict(checkpoint):
+    if not isinstance(checkpoint, dict):
+        return None
+    if "state_dict" in checkpoint:
+        return checkpoint["state_dict"]
+    if "model" in checkpoint:
+        return checkpoint["model"]
+    return checkpoint
+
+
+def _strip_checkpoint_key(key: str) -> str:
+    for prefix in ("module.",):
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
+
+def print_checkpoint_summary(model, checkpoint, args) -> None:
+    state_dict = _checkpoint_state_dict(checkpoint)
+    if not hasattr(state_dict, "keys"):
+        return
+    ckpt_keys = {_strip_checkpoint_key(str(key)) for key in state_dict.keys()}
+    model_keys = set(model.state_dict().keys())
+    missing = sorted(model_keys - ckpt_keys)
+    unexpected = sorted(ckpt_keys - model_keys)
+    matched = len(model_keys & ckpt_keys)
+    should_print = bool(getattr(args, "vad_debug", False)) or bool(missing) or bool(unexpected)
+    if not should_print:
+        return
+    print(
+        "[VAD Checkpoint] "
+        f"matched={matched}/{len(model_keys)} missing={len(missing)} unexpected={len(unexpected)}",
+        flush=True,
+    )
+    if missing:
+        print(f"[VAD Checkpoint] missing sample={missing[:12]}", flush=True)
+    if unexpected:
+        print(f"[VAD Checkpoint] unexpected sample={unexpected[:12]}", flush=True)
+
+
 def build_vad(args: argparse.Namespace):
     vad_root = Path(args.vad_root)
     torch, Config, load_checkpoint, build_model = import_vad_runtime(vad_root)
@@ -96,7 +139,8 @@ def build_vad(args: argparse.Namespace):
     cfg = Config.fromfile(str(vad_root / "projects" / "configs" / "VAD" / config_name))
     cfg.model.pretrained = None
     model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
-    load_checkpoint(model, args.vad_checkpoint, map_location="cpu")
+    checkpoint = load_checkpoint(model, args.vad_checkpoint, map_location="cpu")
+    print_checkpoint_summary(model, checkpoint, args)
     model.to(args.device)
     model.eval()
     return torch, model, cfg
@@ -139,7 +183,16 @@ def make_img_meta(args: argparse.Namespace, cfg) -> dict:
     pad_h = int(np.ceil(scaled_h / 32.0) * 32)
     pad_w = int(np.ceil(scaled_w / 32.0) * 32)
     lidar2img = [
-        lidar2img_matrix(spec, args.camera_width, args.camera_height, args.camera_fov, scale=scale)
+        lidar2img_matrix(
+            spec,
+            args.camera_width,
+            args.camera_height,
+            args.camera_fov,
+            scale=scale,
+            lidar_x=float(getattr(args, "vad_lidar_x", 0.0)),
+            lidar_y=float(getattr(args, "vad_lidar_y", 0.0)),
+            lidar_z=float(getattr(args, "vad_lidar_z", 2.0)),
+        )
         for spec in iter_camera_specs(VAD_CAMERA_ORDER)
     ]
     return {
@@ -199,6 +252,10 @@ def _patch_angle_deg(yaw_rad: float) -> float:
     return float(np.degrees(yaw_rad) % 360.0)
 
 
+def _angle_delta_deg(cur: float, prev: float) -> float:
+    return float((float(cur) - float(prev) + 180.0) % 360.0 - 180.0)
+
+
 def _ego_pose_from_chunk(chunk: Dict[str, np.ndarray], index: int) -> dict:
     # CarDreamer/CARLA world uses x-forward, y-right. VAD/nuScenes BEV
     # expects x-forward, y-left, so convert global y, yaw and yaw-rate here.
@@ -226,7 +283,7 @@ def make_can_bus(cur_pose: dict, prev_pose: dict | None) -> np.ndarray:
     if prev_pose is not None:
         can_bus[0] = float(cur_pose["x"] - prev_pose["x"])
         can_bus[1] = float(cur_pose["y"] - prev_pose["y"])
-        can_bus[-1] = float(cur_pose["patch_angle"] - prev_pose["patch_angle"])
+        can_bus[-1] = _angle_delta_deg(cur_pose["patch_angle"], prev_pose["patch_angle"])
 
     yaw = float(cur_pose["yaw"])
     half_yaw = 0.5 * yaw
@@ -236,8 +293,8 @@ def make_can_bus(cur_pose: dict, prev_pose: dict | None) -> np.ndarray:
         dtype=np.float32,
     )
     can_bus[12] = float(cur_pose["yawrate"])
-    can_bus[13] = float(cur_pose["speed"] * np.cos(yaw))
-    can_bus[14] = float(cur_pose["speed"] * np.sin(yaw))
+    can_bus[13] = float(cur_pose.get("vx", cur_pose["speed"] * np.cos(yaw)))
+    can_bus[14] = float(cur_pose.get("vy", cur_pose["speed"] * np.sin(yaw)))
     can_bus[-2] = float(np.radians(cur_pose["patch_angle"]))
     return can_bus
 

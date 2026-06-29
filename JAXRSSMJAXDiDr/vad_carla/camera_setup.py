@@ -182,12 +182,17 @@ def lidar2img_matrix(
     height: int = 900,
     fov: float = 70.0,
     scale: float = 1.0,
+    lidar_x: float = 0.0,
+    lidar_y: float = 0.0,
+    lidar_z: float = 2.0,
 ) -> np.ndarray:
     """Approximate nuScenes-lidar to image projection for CARLA-mounted cameras.
 
     VAD uses a lidar/ego frame with x forward, y left, z up. CarDreamer local
     vehicle features use x forward, y right, z up, so this function flips the y
-    axis before applying the CARLA camera pose.
+    axis before applying the CARLA camera pose. The camera mount is defined in
+    CARLA ego coordinates, while VAD's projection starts at a pseudo top-lidar
+    origin; subtract the lidar origin before building lidar-to-camera.
     """
 
     k = camera_intrinsic(width, height, fov).astype(np.float32)
@@ -196,7 +201,8 @@ def lidar2img_matrix(
     forward = rot @ np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
     right = rot @ np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
     up = rot @ np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-    cam_t = np.asarray([spec.x, spec.y, spec.z], dtype=np.float32)
+    lidar_t = np.asarray([float(lidar_x), float(lidar_y), float(lidar_z)], dtype=np.float32)
+    cam_t = np.asarray([spec.x, spec.y, spec.z], dtype=np.float32) - lidar_t
 
     # Input point is [x_forward, y_left, z_up]. Convert to CARLA y-right.
     nusc_to_carla = np.asarray(

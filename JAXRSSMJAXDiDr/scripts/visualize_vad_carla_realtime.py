@@ -38,11 +38,15 @@ def parse_args(argv=None):
     parser.add_argument("--camera_width", type=int, default=1600)
     parser.add_argument("--camera_height", type=int, default=900)
     parser.add_argument("--camera_fov", type=float, default=70.0)
+    parser.add_argument("--vad_lidar_x", type=float, default=0.0)
+    parser.add_argument("--vad_lidar_y", type=float, default=0.0)
+    parser.add_argument("--vad_lidar_z", type=float, default=2.0)
     parser.add_argument("--sensor_tick", type=float, default=0.1)
     parser.add_argument("--pretrained_norm", action="store_true", default=True)
     parser.add_argument("--no_pretrained_norm", dest="pretrained_norm", action="store_false")
     parser.add_argument("--score_thresh", type=float, default=0.35)
     parser.add_argument("--map_score_thresh", type=float, default=0.35)
+    parser.add_argument("--ego_cmd", choices=("none", "right", "left", "straight", "all"), default="none")
     parser.add_argument("--bev_size", type=int, default=640)
     parser.add_argument("--front_width", type=int, default=640)
     parser.add_argument("--surround_width", type=int, default=960)
@@ -161,6 +165,8 @@ def ego_pose_from_env(env) -> dict:
         "yaw": float(yaw),
         "patch_angle": float(np.degrees(yaw) % 360.0),
         "speed": speed,
+        "vx": float(vel.x),
+        "vy": -float(vel.y),
         "yawrate": -float(np.radians(ang.z)),
     }
 
@@ -262,6 +268,38 @@ def draw_agent_trajs(canvas, center, trajs, pc_range, color):
         draw_polyline(canvas, pts, pc_range, color, thickness=1)
 
 
+EGO_CMD_TO_INDEX = {
+    "right": 0,
+    "left": 1,
+    "straight": 2,
+}
+
+
+def draw_ego_plan(canvas, ego_fut, pc_range, args):
+    if args.ego_cmd == "none":
+        return
+    plans = np.asarray(ego_fut, dtype=np.float32)
+    if plans.ndim >= 4:
+        plans = plans[0]
+    if plans.size == 0:
+        return
+    colors = {
+        "right": (35, 90, 255),
+        "left": (255, 80, 80),
+        "straight": (60, 150, 60),
+    }
+    if args.ego_cmd == "all":
+        for name, idx in EGO_CMD_TO_INDEX.items():
+            if idx < len(plans):
+                pts = np.cumsum(plans[idx].reshape(-1, 2), axis=0)
+                draw_polyline(canvas, pts, pc_range, colors[name], thickness=2)
+        return
+    idx = EGO_CMD_TO_INDEX[args.ego_cmd]
+    if idx < len(plans):
+        pts = np.cumsum(plans[idx].reshape(-1, 2), axis=0)
+        draw_polyline(canvas, pts, pc_range, colors[args.ego_cmd], thickness=2)
+
+
 def render_bev(result, cfg, args):
     import cv2
 
@@ -313,10 +351,7 @@ def render_bev(result, cfg, args):
 
         ego_fut = to_numpy(result["ego_fut_preds"])
         if ego_fut is not None:
-            plans = np.asarray(ego_fut)[0]
-            for plan in plans[:3]:
-                pts = np.cumsum(plan.reshape(-1, 2), axis=0)
-                draw_polyline(canvas, pts, pc_range, (50, 50, 255), thickness=2)
+            draw_ego_plan(canvas, ego_fut, pc_range, args)
 
     ego_px = point_to_bev((0.0, 0.0), pc_range, size)
     cv2.circle(canvas, ego_px, 5, (0, 0, 0), -1)
@@ -328,13 +363,18 @@ def vad_image_scale(args):
     return 0.4 if args.vad_model == "tiny" else 0.8
 
 
+def vad_ground_z(args):
+    return -float(getattr(args, "vad_lidar_z", 2.0))
+
+
 def project_debug_grid(meta, cfg, args, cam_idx, nx=9, ny=17):
     pc_range = np.asarray(getattr(cfg, "point_cloud_range", [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0]), dtype=np.float32)
     xs = np.linspace(float(pc_range[0]), float(pc_range[3]), nx, dtype=np.float32)
     ys = np.linspace(float(pc_range[1]), float(pc_range[4]), ny, dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys)
+    zz = np.full(xx.size, vad_ground_z(args), dtype=np.float32)
     pts = np.stack(
-        [xx.reshape(-1), yy.reshape(-1), np.zeros(xx.size, dtype=np.float32), np.ones(xx.size, dtype=np.float32)],
+        [xx.reshape(-1), yy.reshape(-1), zz, np.ones(xx.size, dtype=np.float32)],
         axis=0,
     )
     lidar2img = np.asarray(meta["lidar2img"][cam_idx], dtype=np.float32)
@@ -379,10 +419,17 @@ def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose)
     map_count = int(np.sum(map_scores >= args.map_score_thresh)) if map_scores is not None else 0
     total_boxes = int(len(boxes)) if boxes is not None else 0
     total_maps = int(len(map_scores)) if map_scores is not None else 0
+    top_det_scores = []
+    top_map_scores = []
+    if scores is not None and len(scores):
+        top_det_scores = np.sort(np.asarray(scores, dtype=np.float32).reshape(-1))[-5:][::-1].round(3).tolist()
+    if map_scores is not None and len(map_scores):
+        top_map_scores = np.sort(np.asarray(map_scores, dtype=np.float32).reshape(-1))[-5:][::-1].round(3).tolist()
     prev_flag = prev_pose is not None and not args.no_temporal_bev
     print(
         "[VAD Debug] "
         f"step={step} model={args.vad_model} prev_bev={prev_flag} "
+        f"vad_lidar=({args.vad_lidar_x:.2f},{args.vad_lidar_y:.2f},{args.vad_lidar_z:.2f}) "
         f"raw_front_shape={tuple(raw_shape)} tensor_shape={tuple(img_np.shape)} "
         f"meta_ori={meta['ori_shape'][0]} meta_img={meta['img_shape'][0]} meta_pad={meta['pad_shape'][0]}",
         flush=True,
@@ -400,7 +447,8 @@ def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose)
         "[VAD Debug] "
         f"projection_grid={projection_coverage_summary(meta, cfg, args)} "
         f"dets={det_count}/{total_boxes}@{args.score_thresh:.2f} "
-        f"maps={map_count}/{total_maps}@{args.map_score_thresh:.2f}",
+        f"maps={map_count}/{total_maps}@{args.map_score_thresh:.2f} "
+        f"top_det={top_det_scores} top_map={top_map_scores}",
         flush=True,
     )
 
@@ -775,13 +823,14 @@ def main(argv=None):
                 action = manual_action
 
             if step % max(int(args.vad_every), 1) == 0:
-                can_bus = make_can_bus(pose, prev_pose)
+                can_bus_prev_pose = None if args.no_temporal_bev else prev_pose
+                can_bus = make_can_bus(pose, can_bus_prev_pose)
                 meta = make_frame_img_meta(
                     base_meta,
                     can_bus,
                     Path(args.task),
                     step,
-                    prev_pose is not None and not args.no_temporal_bev,
+                    can_bus_prev_pose is not None,
                 )
                 img_np = normalize_and_resize(images, args, cfg)
                 try:
