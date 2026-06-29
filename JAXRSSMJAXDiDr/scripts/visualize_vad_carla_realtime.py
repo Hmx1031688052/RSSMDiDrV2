@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 from pathlib import Path
 import sys
@@ -50,6 +51,15 @@ def parse_args(argv=None):
     parser.add_argument("--action_acc", type=float, default=0.0)
     parser.add_argument("--action_steer", type=float, default=0.0)
     parser.add_argument("--manual_action", action="store_true")
+    parser.add_argument("--csv_control", action="store_true", help="Use CARLA BasicAgent to follow a CSV route.")
+    parser.add_argument("--route_csv", default="", help="Route CSV with x,y columns. Defaults to task env.route_csv.")
+    parser.add_argument("--csv_x_col", default="x")
+    parser.add_argument("--csv_y_col", default="y")
+    parser.add_argument("--csv_target_speed", type=float, default=20.0, help="BasicAgent target speed in km/h.")
+    parser.add_argument("--csv_min_waypoint_dist", type=float, default=0.5)
+    parser.add_argument("--csv_respect_traffic_lights", action="store_true")
+    parser.add_argument("--csv_respect_vehicles", action="store_true")
+    parser.add_argument("--csv_draw_route", action="store_true")
     parser.add_argument("--cmd_timeout_s", type=float, default=0.25)
     parser.add_argument("--spin_timeout_sec", type=float, default=0.0)
     parser.add_argument("--steer_max_deg", type=float, default=120.0)
@@ -378,6 +388,186 @@ def make_env_action(env, args):
     return action
 
 
+def get_config_value(config, key, default=None):
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        try:
+            return config.get(key, default)
+        except Exception:
+            pass
+    return getattr(config, key, default)
+
+
+def resolve_route_csv(env, args):
+    route_csv = args.route_csv or get_config_value(getattr(env, "_config", None), "route_csv", "")
+    if not route_csv:
+        return None
+    path = Path(route_csv).expanduser()
+    if path.is_absolute():
+        return path
+    candidates = [
+        Path.cwd() / path,
+        ROOT / path,
+        ROOT.parent / path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def load_csv_route_points(path, x_col="x", y_col="y"):
+    points = []
+    with Path(path).open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or x_col not in reader.fieldnames or y_col not in reader.fieldnames:
+            raise ValueError(f"CSV route must contain columns {x_col!r} and {y_col!r}: {path}")
+        for row in reader:
+            if row.get(x_col, "") == "" or row.get(y_col, "") == "":
+                continue
+            points.append((float(row[x_col]), float(row[y_col])))
+    if len(points) < 2:
+        raise ValueError(f"CSV route needs at least two points: {path}")
+    return points
+
+
+def route_points_from_env_planner(env):
+    if not hasattr(env, "get_ego_planner"):
+        return []
+    planner = env.get_ego_planner()
+    if not hasattr(planner, "get_global_waypoints"):
+        return []
+    return [(float(wp[0]), float(wp[1])) for wp in planner.get_global_waypoints()]
+
+
+def get_fixed_delta_seconds(env):
+    candidates = []
+    try:
+        candidates.append(env._world._settings.fixed_delta_seconds)
+    except Exception:
+        pass
+    try:
+        candidates.append(env.get_ego_vehicle().get_world().get_settings().fixed_delta_seconds)
+    except Exception:
+        pass
+    for value in candidates:
+        try:
+            value = float(value)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+    return 0.05
+
+
+def make_basic_agent_route(env, points, args):
+    import carla
+    from car_dreamer.toolkit.planner.agents.navigation.local_planner import RoadOption
+
+    ego = env.get_ego_vehicle() if hasattr(env, "get_ego_vehicle") else env.ego
+    carla_map = ego.get_world().get_map()
+    plan = []
+    last_loc = None
+    min_dist = max(float(args.csv_min_waypoint_dist), 0.0)
+    for x, y in points:
+        loc = carla.Location(x=float(x), y=float(y), z=0.1)
+        waypoint = carla_map.get_waypoint(
+            loc,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        if waypoint is None:
+            continue
+        wp_loc = waypoint.transform.location
+        if last_loc is not None and wp_loc.distance(last_loc) < min_dist:
+            continue
+        plan.append((waypoint, RoadOption.LANEFOLLOW))
+        last_loc = wp_loc
+    if len(plan) < 2:
+        raise RuntimeError("Could not project enough CSV points onto CARLA driving lanes.")
+    return plan
+
+
+def draw_basic_agent_route(env, plan):
+    import carla
+
+    try:
+        world = env.get_ego_vehicle().get_world()
+        color = carla.Color(0, 180, 255)
+        for (wp0, _), (wp1, _) in zip(plan[:-1], plan[1:]):
+            p0 = wp0.transform.location + carla.Location(z=0.35)
+            p1 = wp1.transform.location + carla.Location(z=0.35)
+            world.debug.draw_line(p0, p1, thickness=0.08, color=color, life_time=30.0)
+    except Exception as exc:
+        print(f"[CSV Control] route debug draw skipped: {exc}", flush=True)
+
+
+def init_csv_basic_agent(env, args):
+    from car_dreamer.toolkit.planner.agents.navigation.basic_agent import BasicAgent
+
+    route_path = resolve_route_csv(env, args)
+    if route_path is not None:
+        if not route_path.exists():
+            raise FileNotFoundError(f"CSV route not found: {route_path}")
+        points = load_csv_route_points(route_path, args.csv_x_col, args.csv_y_col)
+        route_label = str(route_path)
+    else:
+        points = route_points_from_env_planner(env)
+        route_label = "env planner"
+
+    if not points:
+        raise RuntimeError(
+            "CSV control needs --route_csv or a task config with env.route_csv/global waypoints."
+        )
+
+    plan = make_basic_agent_route(env, points, args)
+    ego = env.get_ego_vehicle() if hasattr(env, "get_ego_vehicle") else env.ego
+    carla_map = ego.get_world().get_map()
+    opt_dict = {
+        "target_speed": float(args.csv_target_speed),
+        "dt": get_fixed_delta_seconds(env),
+        "ignore_traffic_lights": not bool(args.csv_respect_traffic_lights),
+        "ignore_vehicles": not bool(args.csv_respect_vehicles),
+    }
+    agent = BasicAgent(
+        ego,
+        target_speed=float(args.csv_target_speed),
+        opt_dict=opt_dict,
+        map_inst=carla_map,
+    )
+    agent.set_global_plan(plan, stop_waypoint_creation=True, clean_queue=True)
+    if args.csv_draw_route:
+        draw_basic_agent_route(env, plan)
+    print(
+        "[CSV Control] BasicAgent route loaded "
+        f"source={route_label} raw_points={len(points)} projected_waypoints={len(plan)} "
+        f"target_speed={args.csv_target_speed:.1f}km/h",
+        flush=True,
+    )
+    return agent
+
+
+def vehicle_control_to_env_action(control, env):
+    acc = 3.0 * float(control.throttle) - 3.0 * float(control.brake)
+    steer = -float(control.steer)
+    action = np.asarray([acc, steer], dtype=np.float32)
+    space = getattr(env, "action_space", None)
+    if space is not None and hasattr(space, "low") and hasattr(space, "high"):
+        low = np.asarray(space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(space.high, dtype=np.float32).reshape(-1)
+        if low.size >= 2 and high.size >= 2:
+            action = np.clip(action, low[:2], high[:2]).astype(np.float32)
+    return action
+
+
+def csv_basic_agent_action(agent, env):
+    if agent.done():
+        return np.asarray([-3.0, 0.0], dtype=np.float32)
+    control = agent.run_step()
+    return vehicle_control_to_env_action(control, env)
+
+
 def update_speed_pid_dt(env, speed_pid):
     try:
         fixed_delta = float(env._world._settings.fixed_delta_seconds)
@@ -444,8 +634,13 @@ def main(argv=None):
     latest_result = None
     manual_action = make_env_action(env, args)
     ros2 = None
+    csv_agent = None
     timeout_count = 0
-    if not args.manual_action:
+    if args.csv_control:
+        if args.manual_action:
+            print("[CSV Control] --csv_control enabled; ignoring --manual_action.", flush=True)
+        csv_agent = init_csv_basic_agent(env, args)
+    elif not args.manual_action:
         ros2 = init_ros2_expert(args)
         _, _, bridge, speed_pid = ros2
         reset_ros2_expert(bridge, speed_pid)
@@ -462,7 +657,9 @@ def main(argv=None):
             images = stack_vad_images(obs)
             pose = ego_pose_from_env(env)
 
-            if ros2 is not None:
+            if csv_agent is not None:
+                action = csv_basic_agent_action(csv_agent, env)
+            elif ros2 is not None:
                 cp, rclpy, bridge, speed_pid = ros2
                 action, timeout_count = ros2_expert_action(
                     cp, rclpy, bridge, speed_pid, env, args, timeout_count)
@@ -497,6 +694,8 @@ def main(argv=None):
                 prev_pose = None
                 latest_result = None
                 timeout_count = 0
+                if csv_agent is not None:
+                    csv_agent = init_csv_basic_agent(env, args)
                 if ros2 is not None:
                     _, _, bridge, speed_pid = ros2
                     reset_ros2_expert(bridge, speed_pid)
