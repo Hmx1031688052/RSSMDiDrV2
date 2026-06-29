@@ -18,6 +18,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from JAXRSSMJAXDiDr.scripts.export_vad_latents import (
+    DEFAULT_VAD_LIDAR_X,
+    DEFAULT_VAD_LIDAR_Y,
+    DEFAULT_VAD_LIDAR_Z,
     build_vad,
     make_can_bus,
     make_frame_img_meta,
@@ -38,9 +41,12 @@ def parse_args(argv=None):
     parser.add_argument("--camera_width", type=int, default=1600)
     parser.add_argument("--camera_height", type=int, default=900)
     parser.add_argument("--camera_fov", type=float, default=70.0)
-    parser.add_argument("--vad_lidar_x", type=float, default=0.0)
-    parser.add_argument("--vad_lidar_y", type=float, default=0.0)
-    parser.add_argument("--vad_lidar_z", type=float, default=2.0)
+    parser.add_argument("--vad_lidar_x", type=float, default=DEFAULT_VAD_LIDAR_X)
+    parser.add_argument("--vad_lidar_y", type=float, default=DEFAULT_VAD_LIDAR_Y)
+    parser.add_argument("--vad_lidar_z", type=float, default=DEFAULT_VAD_LIDAR_Z)
+    parser.add_argument("--auto_calibrate_vad", action="store_true")
+    parser.add_argument("--calib_lidar_x_values", default="0.0,0.4,0.8,1.0,1.2")
+    parser.add_argument("--calib_lidar_z_values", default="1.8,2.0,2.3,2.5,2.7")
     parser.add_argument("--sensor_tick", type=float, default=0.1)
     parser.add_argument("--pretrained_norm", action="store_true", default=True)
     parser.add_argument("--no_pretrained_norm", dest="pretrained_norm", action="store_false")
@@ -364,7 +370,7 @@ def vad_image_scale(args):
 
 
 def vad_ground_z(args):
-    return -float(getattr(args, "vad_lidar_z", 2.0))
+    return -float(getattr(args, "vad_lidar_z", DEFAULT_VAD_LIDAR_Z))
 
 
 def project_debug_grid(meta, cfg, args, cam_idx, nx=9, ny=17):
@@ -451,6 +457,95 @@ def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose)
         f"top_det={top_det_scores} top_map={top_map_scores}",
         flush=True,
     )
+
+
+def parse_float_list(text):
+    values = []
+    for item in str(text).split(","):
+        item = item.strip()
+        if item:
+            values.append(float(item))
+    if not values:
+        raise ValueError(f"Expected at least one float value, got {text!r}")
+    return values
+
+
+def mean_top_scores(values, k):
+    if values is None:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return 0.0
+    arr = np.sort(arr)[-min(int(k), arr.size):]
+    return float(arr.mean())
+
+
+def vad_result_confidence(result):
+    if result is None:
+        return 0.0, 0.0, 0.0
+    scores = to_numpy(result["scores"])
+    map_scores = to_numpy(result["map_scores"])
+    det_score = mean_top_scores(scores, 5)
+    map_score = mean_top_scores(map_scores, 5)
+    det_bonus = 0.0 if scores is None else 0.01 * float(np.sum(np.asarray(scores) >= 0.15))
+    map_bonus = 0.0 if map_scores is None else 0.005 * float(np.sum(np.asarray(map_scores) >= 0.15))
+    total = 0.7 * det_score + 0.3 * map_score + det_bonus + map_bonus
+    return float(total), float(det_score), float(map_score)
+
+
+def clone_args_with_lidar(args, lidar_x, lidar_z):
+    clone = argparse.Namespace(**vars(args))
+    clone.vad_lidar_x = float(lidar_x)
+    clone.vad_lidar_z = float(lidar_z)
+    return clone
+
+
+def auto_calibrate_vad_geometry(torch, model, img_np, pose, args, cfg, box_type_3d):
+    x_values = parse_float_list(args.calib_lidar_x_values)
+    z_values = parse_float_list(args.calib_lidar_z_values)
+    trials = []
+    best = None
+    print(
+        "[VAD Calib] sweeping pseudo-lidar origin "
+        f"x={x_values} z={z_values}",
+        flush=True,
+    )
+    for lidar_x in x_values:
+        for lidar_z in z_values:
+            trial_args = clone_args_with_lidar(args, lidar_x, lidar_z)
+            trial_meta = make_img_meta(trial_args, cfg)
+            trial_meta["box_type_3d"] = box_type_3d
+            can_bus = make_can_bus(pose, None)
+            meta = make_frame_img_meta(trial_meta, can_bus, Path(args.task), 0, False)
+            try:
+                trial_prev_bev, result = run_vad_tensor(torch, model, img_np, meta, trial_args, None)
+                score, det_score, map_score = vad_result_confidence(result)
+            except Exception as exc:
+                print(f"[VAD Calib] x={lidar_x:.2f} z={lidar_z:.2f} failed: {exc}", flush=True)
+                continue
+            trials.append((score, det_score, map_score, lidar_x, lidar_z, trial_meta, trial_prev_bev, result, meta))
+            print(
+                "[VAD Calib] "
+                f"x={lidar_x:.2f} z={lidar_z:.2f} score={score:.3f} "
+                f"det_top={det_score:.3f} map_top={map_score:.3f}",
+                flush=True,
+            )
+            if best is None or score > best[0]:
+                best = trials[-1]
+
+    if best is None:
+        raise RuntimeError("VAD auto calibration failed for all candidates.")
+
+    score, det_score, map_score, lidar_x, lidar_z, base_meta, prev_bev, result, meta = best
+    args.vad_lidar_x = float(lidar_x)
+    args.vad_lidar_z = float(lidar_z)
+    print(
+        "[VAD Calib] selected "
+        f"x={lidar_x:.2f} z={lidar_z:.2f} score={score:.3f} "
+        f"det_top={det_score:.3f} map_top={map_score:.3f}",
+        flush=True,
+    )
+    return base_meta, prev_bev, result, meta
 
 
 SURROUND_LAYOUT = (
@@ -791,6 +886,7 @@ def main(argv=None):
     manual_action = make_env_action(env, args)
     ros2 = None
     csv_agent = None
+    vad_calibrated = not bool(args.auto_calibrate_vad)
     timeout_count = 0
     if args.csv_control:
         if args.manual_action:
@@ -834,9 +930,14 @@ def main(argv=None):
                 )
                 img_np = normalize_and_resize(images, args, cfg)
                 try:
-                    vad_prev_bev = None if args.no_temporal_bev else prev_bev
-                    next_prev_bev, latest_result = run_vad_tensor(
-                        torch, model, img_np, meta, args, vad_prev_bev)
+                    if not vad_calibrated:
+                        base_meta, next_prev_bev, latest_result, meta = auto_calibrate_vad_geometry(
+                            torch, model, img_np, pose, args, cfg, box_type_3d)
+                        vad_calibrated = True
+                    else:
+                        vad_prev_bev = None if args.no_temporal_bev else prev_bev
+                        next_prev_bev, latest_result = run_vad_tensor(
+                            torch, model, img_np, meta, args, vad_prev_bev)
                     prev_bev = None if args.no_temporal_bev else next_prev_bev
                     print_vad_debug(step, obs, img_np, meta, latest_result, cfg, args, pose, prev_pose)
                     prev_pose = pose
@@ -862,6 +963,7 @@ def main(argv=None):
                 prev_pose = None
                 latest_result = None
                 timeout_count = 0
+                vad_calibrated = not bool(args.auto_calibrate_vad)
                 if csv_agent is not None:
                     csv_agent = init_csv_basic_agent(env, args)
                 if ros2 is not None:

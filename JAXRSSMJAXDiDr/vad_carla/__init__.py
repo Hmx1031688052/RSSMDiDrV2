@@ -1,6 +1,9 @@
 """CARLA/VAD integration helpers for the JAX RSSM pipeline."""
 
 from .camera_setup import (
+    DEFAULT_VAD_LIDAR_X,
+    DEFAULT_VAD_LIDAR_Y,
+    DEFAULT_VAD_LIDAR_Z,
     VAD_CAMERA_KEYS,
     VAD_CAMERA_ORDER,
     VADCameraSpec,
@@ -11,6 +14,9 @@ from .camera_setup import (
 )
 
 __all__ = [
+    "DEFAULT_VAD_LIDAR_X",
+    "DEFAULT_VAD_LIDAR_Y",
+    "DEFAULT_VAD_LIDAR_Z",
     "VAD_CAMERA_KEYS",
     "VAD_CAMERA_ORDER",
     "VADCameraSpec",

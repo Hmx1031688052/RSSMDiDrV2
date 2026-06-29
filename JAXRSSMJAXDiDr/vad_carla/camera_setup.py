@@ -50,6 +50,9 @@ VAD_CAMERA_SPECS = {
     "CAM_BACK_RIGHT": VADCameraSpec("CAM_BACK_RIGHT", "camera_back_right", -1.3, 0.45, 2.0, 125.0),
 }
 
+DEFAULT_VAD_LIDAR_X = 0.8
+DEFAULT_VAD_LIDAR_Y = 0.0
+DEFAULT_VAD_LIDAR_Z = 2.3
 VAD_CAMERA_KEYS = tuple(VAD_CAMERA_SPECS[name].key for name in VAD_CAMERA_ORDER)
 SIDECAR_PATH_BYTES = 256
 
@@ -182,9 +185,9 @@ def lidar2img_matrix(
     height: int = 900,
     fov: float = 70.0,
     scale: float = 1.0,
-    lidar_x: float = 0.0,
-    lidar_y: float = 0.0,
-    lidar_z: float = 2.0,
+    lidar_x: float = DEFAULT_VAD_LIDAR_X,
+    lidar_y: float = DEFAULT_VAD_LIDAR_Y,
+    lidar_z: float = DEFAULT_VAD_LIDAR_Z,
 ) -> np.ndarray:
     """Approximate nuScenes-lidar to image projection for CARLA-mounted cameras.
 

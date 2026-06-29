@@ -21,6 +21,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from JAXRSSMJAXDiDr.vad_carla.camera_setup import (
+    DEFAULT_VAD_LIDAR_X,
+    DEFAULT_VAD_LIDAR_Y,
+    DEFAULT_VAD_LIDAR_Z,
     VAD_CAMERA_KEYS,
     VAD_CAMERA_ORDER,
     iter_camera_specs,
@@ -39,9 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera_width", type=int, default=1600)
     parser.add_argument("--camera_height", type=int, default=900)
     parser.add_argument("--camera_fov", type=float, default=70.0)
-    parser.add_argument("--vad_lidar_x", type=float, default=0.0)
-    parser.add_argument("--vad_lidar_y", type=float, default=0.0)
-    parser.add_argument("--vad_lidar_z", type=float, default=2.0)
+    parser.add_argument("--vad_lidar_x", type=float, default=DEFAULT_VAD_LIDAR_X)
+    parser.add_argument("--vad_lidar_y", type=float, default=DEFAULT_VAD_LIDAR_Y)
+    parser.add_argument("--vad_lidar_z", type=float, default=DEFAULT_VAD_LIDAR_Z)
     parser.add_argument("--output_key", default="vad_scene_latent")
     parser.add_argument("--pool", choices=("mean", "mean_std"), default="mean_std")
     parser.add_argument(
@@ -189,9 +192,9 @@ def make_img_meta(args: argparse.Namespace, cfg) -> dict:
             args.camera_height,
             args.camera_fov,
             scale=scale,
-            lidar_x=float(getattr(args, "vad_lidar_x", 0.0)),
-            lidar_y=float(getattr(args, "vad_lidar_y", 0.0)),
-            lidar_z=float(getattr(args, "vad_lidar_z", 2.0)),
+            lidar_x=float(getattr(args, "vad_lidar_x", DEFAULT_VAD_LIDAR_X)),
+            lidar_y=float(getattr(args, "vad_lidar_y", DEFAULT_VAD_LIDAR_Y)),
+            lidar_z=float(getattr(args, "vad_lidar_z", DEFAULT_VAD_LIDAR_Z)),
         )
         for spec in iter_camera_specs(VAD_CAMERA_ORDER)
     ]
