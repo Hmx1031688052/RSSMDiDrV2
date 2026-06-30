@@ -47,6 +47,59 @@ B2D_MAP_COLORS = {
 }
 
 
+def b2d_agent_colormap():
+    try:
+        import seaborn as sns
+
+        colors = [[int(c * 255.0) for c in clr] for clr in sns.color_palette("bright", n_colors=10)]
+    except Exception:
+        colors = [
+            [2, 62, 255],
+            [255, 124, 0],
+            [26, 201, 56],
+            [255, 0, 16],
+            [128, 0, 128],
+            [139, 87, 66],
+            [251, 0, 255],
+            [161, 161, 161],
+            [255, 255, 0],
+            [0, 255, 255],
+        ]
+    return {
+        6: colors[8],
+        4: colors[8],
+        3: colors[0],
+        1: colors[6],
+        0: colors[2],
+        8: colors[7],
+        7: colors[1],
+        5: colors[3],
+        2: colors[5],
+    }
+
+
+def b2d_agent_coor2topdown():
+    coor2topdown = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, 50.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    topdown_intrinsics = np.asarray(
+        [
+            [548.993771650447, 0.0, 256.0, 0.0],
+            [0.0, 548.993771650447, 256.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return topdown_intrinsics @ coor2topdown
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", default="carla_roundabout")
@@ -93,6 +146,12 @@ def parse_args(argv=None):
         help="Maximum B2D local-map predictions drawn per map class.",
     )
     parser.add_argument("--map_draw_labels", action="store_true")
+    parser.add_argument(
+        "--bev_render_style",
+        choices=("auto", "b2d_agent", "map_debug"),
+        default="auto",
+        help="BEV rendering style. auto uses B2D agent visualization for B2D runtime.",
+    )
     parser.add_argument("--bev_size", type=int, default=640)
     parser.add_argument("--front_width", type=int, default=640)
     parser.add_argument("--surround_width", type=int, default=960)
@@ -550,6 +609,148 @@ def draw_agent_trajs(canvas, center, trajs, pc_range, color):
         draw_polyline(canvas, pts, pc_range, color, thickness=1)
 
 
+def b2d_tensor_to_numpy(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def b2d_draw_traj_bev(traj, raw_img, coor2topdown, canvas_size=(512, 512), thickness=3,
+                      is_ego=False, hue_start=120, hue_end=80):
+    import cv2
+
+    line = np.asarray(traj, dtype=np.float32)
+    if is_ego:
+        line = np.concatenate([np.zeros((1, 2), dtype=np.float32), line], axis=0)
+    if line.shape[0] < 2:
+        return raw_img
+    img = raw_img.copy()
+    pts_4d = np.stack(
+        [line[:, 0], line[:, 1], np.zeros((line.shape[0],), dtype=np.float32), np.ones((line.shape[0],), dtype=np.float32)]
+    )
+    pts_2d = (coor2topdown @ pts_4d).T
+    pts_2d[:, 0] /= pts_2d[:, 2]
+    pts_2d[:, 1] /= pts_2d[:, 2]
+    mask = (
+        (pts_2d[:, 0] > 0)
+        & (pts_2d[:, 0] < canvas_size[1])
+        & (pts_2d[:, 1] > 0)
+        & (pts_2d[:, 1] < canvas_size[0])
+    )
+    if not mask.any():
+        return img
+    pts_2d = pts_2d[mask, 0:2]
+    try:
+        from scipy.interpolate import splev, splprep
+
+        tck, _ = splprep([pts_2d[:, 0], pts_2d[:, 1]], s=0)
+        smoothed_pts = np.stack(splev(np.linspace(0, 1, 100), tck)).astype(int).T
+    except Exception:
+        smoothed_pts = pts_2d.astype(int)
+
+    num_points = len(smoothed_pts)
+    for i in range(num_points - 1):
+        hue = hue_start + (hue_end - hue_start) * (i / max(num_points, 1))
+        hsv_color = np.array([hue, 255, 255], dtype=np.uint8)
+        rgb_color = cv2.cvtColor(hsv_color[np.newaxis, np.newaxis, :], cv2.COLOR_HSV2RGB).reshape(-1)
+        rgb_color_tuple = (float(rgb_color[0]), float(rgb_color[1]), float(rgb_color[2]))
+        if (
+            smoothed_pts[i, 0] > 0
+            and smoothed_pts[i, 0] < canvas_size[1]
+            and smoothed_pts[i, 1] > 0
+            and smoothed_pts[i, 1] < canvas_size[0]
+        ):
+            cv2.line(
+                img,
+                (smoothed_pts[i, 0], smoothed_pts[i, 1]),
+                (smoothed_pts[i + 1, 0], smoothed_pts[i + 1, 1]),
+                color=rgb_color_tuple,
+                thickness=thickness,
+            )
+        elif i == 0:
+            break
+    return img
+
+
+def b2d_plot_rect3d_on_img(img, rect_corners, scores, labels, bev=False):
+    import cv2
+
+    line_indices = ((0, 1), (0, 3), (0, 4), (1, 2), (1, 5), (3, 2), (3, 7),
+                    (4, 5), (4, 7), (2, 6), (5, 6), (6, 7))
+    if bev:
+        line_indices = ((0, 3), (3, 7), (4, 7), (0, 4))
+    colormap = b2d_agent_colormap()
+    out = img.copy()
+    for i in range(len(rect_corners)):
+        if scores is not None and scores[i] < 0.3:
+            continue
+        color = colormap.get(int(labels[i]), [0, 255, 0])
+        corners = rect_corners[i].astype(int)
+        for start, end in line_indices:
+            cv2.line(out, (corners[start, 0], corners[start, 1]), (corners[end, 0], corners[end, 1]),
+                     color, 2, cv2.LINE_AA)
+    return out.astype(np.uint8)
+
+
+def b2d_draw_lidar_bbox3d_on_img(bboxes3d, raw_img, lidar2img_rt, scores=None, labels=None,
+                                 trajs=None, canvas_size=(900, 1600)):
+    if bboxes3d is None or not hasattr(bboxes3d, "corners") or not hasattr(bboxes3d, "tensor"):
+        return raw_img
+    img = raw_img.copy()
+    bboxes3d_numpy = b2d_tensor_to_numpy(bboxes3d.tensor)
+    if bboxes3d_numpy is None or len(bboxes3d_numpy) == 0:
+        return img
+    corners_3d = b2d_tensor_to_numpy(bboxes3d.corners)
+    num_bbox = corners_3d.shape[0]
+    pts_4d = np.concatenate(
+        [corners_3d.reshape(-1, 3), np.ones((num_bbox * 8, 1), dtype=np.float32)],
+        axis=-1,
+    )
+    lidar2img_rt = np.asarray(lidar2img_rt, dtype=np.float32).reshape(4, 4)
+    scores = b2d_tensor_to_numpy(scores)
+    labels = b2d_tensor_to_numpy(labels)
+    trajs = b2d_tensor_to_numpy(trajs)
+
+    pts_2d = (lidar2img_rt @ pts_4d.T).T
+    pts_2d[:, 0] /= pts_2d[:, 2]
+    pts_2d[:, 1] /= pts_2d[:, 2]
+    imgfov_pts_2d = pts_2d[..., :2].reshape(num_bbox, 8, 2)
+    depth = pts_2d[..., 2].reshape(num_bbox, 8)
+    mask1 = (
+        (imgfov_pts_2d[:, :, 0] > -1e5)
+        & (imgfov_pts_2d[:, :, 0] < 1e5)
+        & (imgfov_pts_2d[:, :, 1] > -1e5)
+        & (imgfov_pts_2d[:, :, 1] < 1e5)
+        & (depth > -1)
+    ).all(-1)
+    mask2 = (imgfov_pts_2d.reshape(num_bbox, 16).max(axis=-1) - imgfov_pts_2d.reshape(num_bbox, 16).min(axis=-1)) < 2000
+    mask = mask1 & mask2
+    if scores is not None:
+        mask = mask & (scores >= 0.3)
+    if not mask.any():
+        return img
+
+    masked_scores = scores[mask] if scores is not None else None
+    masked_labels = labels[mask] if labels is not None else np.zeros((int(mask.sum()),), dtype=np.int64)
+    masked_corners = imgfov_pts_2d[mask]
+
+    if trajs is not None:
+        masked_trajs = trajs[mask]
+        masked_agent_boxes = bboxes3d_numpy[mask]
+        coor2topdown = b2d_agent_coor2topdown()
+        for traj, agent_box, label in zip(masked_trajs, masked_agent_boxes, masked_labels):
+            if int(label) in [0, 1, 2, 3, 7]:
+                for mode_idx in range(min(6, traj.shape[0])):
+                    traj1 = np.concatenate([np.zeros((1, 2), dtype=np.float32), traj[mode_idx].reshape(6, 2)], axis=0)
+                    traj1 = np.cumsum(traj1, axis=0) + agent_box[None, 0:2]
+                    if canvas_size == (512, 512):
+                        img = b2d_draw_traj_bev(traj1, img, coor2topdown, hue_start=0, hue_end=20)
+
+    return b2d_plot_rect3d_on_img(img, masked_corners, masked_scores, masked_labels, bev=(canvas_size != (900, 1600)))
+
+
 def map_classes_for_cfg(cfg) -> tuple[str, ...]:
     classes = getattr(cfg, "map_classes", None)
     if classes is None:
@@ -612,7 +813,40 @@ def draw_map_prediction(canvas, pts, label: int, score: float, pc_range, cfg, ar
         )
 
 
-def render_bev(result, cfg, args):
+def resolve_bev_render_style(args):
+    style = getattr(args, "bev_render_style", "auto")
+    if style == "auto":
+        return "b2d_agent" if getattr(args, "vad_runtime", "official") == "b2d" else "map_debug"
+    return style
+
+
+def render_b2d_agent_bev(result, obs, args):
+    import cv2
+
+    if obs is not None and "bev" in obs:
+        canvas_rgb = np.asarray(obs["bev"], dtype=np.uint8).copy()
+        if canvas_rgb.shape[:2] != (512, 512):
+            canvas_rgb = cv2.resize(canvas_rgb, (512, 512))
+    else:
+        canvas_rgb = np.full((512, 512, 3), 245, dtype=np.uint8)
+
+    if result is not None:
+        canvas_rgb = b2d_draw_lidar_bbox3d_on_img(
+            result.get("boxes"),
+            canvas_rgb,
+            b2d_agent_coor2topdown(),
+            scores=result.get("scores"),
+            labels=result.get("labels"),
+            trajs=result.get("trajs"),
+            canvas_size=(512, 512),
+        )
+    return cv2.cvtColor(canvas_rgb.astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+
+def render_bev(result, cfg, args, obs=None):
+    if resolve_bev_render_style(args) == "b2d_agent":
+        return render_b2d_agent_bev(result, obs, args)
+
     import cv2
 
     size = int(args.bev_size)
@@ -905,13 +1139,37 @@ SURROUND_LAYOUT = (
 )
 
 
-def _render_camera_tile(obs, key, label, tile_size, args=None, meta=None, cfg=None, cam_idx=None):
+def _render_camera_tile(obs, key, label, tile_size, args=None, meta=None, cfg=None, cam_idx=None, result=None):
     import cv2
 
     if key not in obs:
         raise KeyError(f"Observation is missing camera key: {key}")
     tile_w, tile_h = tile_size
     image = np.asarray(obs[key])
+    if (
+        args is not None
+        and result is not None
+        and cam_idx is not None
+        and resolve_bev_render_style(args) == "b2d_agent"
+    ):
+        lidar2img = lidar2img_matrices(
+            args.camera_profile,
+            args.camera_width,
+            args.camera_height,
+            args.camera_fov,
+            scale=1.0,
+            lidar_x=float(args.vad_lidar_x),
+            lidar_y=float(args.vad_lidar_y),
+            lidar_z=float(args.vad_lidar_z),
+        )[cam_idx]
+        image = b2d_draw_lidar_bbox3d_on_img(
+            result.get("boxes"),
+            image,
+            lidar2img,
+            scores=result.get("scores"),
+            labels=result.get("labels"),
+            canvas_size=(900, 1600),
+        )
     image = cv2.resize(image, (tile_w, tile_h))
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     if args is not None and meta is not None and cfg is not None and cam_idx is not None and args.vad_debug_overlay:
@@ -936,7 +1194,7 @@ def _render_camera_tile(obs, key, label, tile_size, args=None, meta=None, cfg=No
     return image
 
 
-def render_surround(obs, args, meta=None, cfg=None):
+def render_surround(obs, args, meta=None, cfg=None, result=None):
     import cv2
 
     camera_keys = get_camera_keys(args.camera_profile)
@@ -955,6 +1213,7 @@ def render_surround(obs, args, meta=None, cfg=None):
             meta=meta,
             cfg=cfg,
             cam_idx=camera_keys.index(key) if key in camera_keys else None,
+            result=result,
         )
         for key, label in SURROUND_LAYOUT
     ]
@@ -1334,8 +1593,8 @@ def main(argv=None):
                         "and the CARLA camera/calibration/meta input contract."
                     ) from exc
 
-            surround = render_surround(obs, args, meta=base_meta, cfg=cfg)
-            bev = render_bev(latest_result, cfg, args)
+            surround = render_surround(obs, args, meta=base_meta, cfg=cfg, result=latest_result)
+            bev = render_bev(latest_result, cfg, args, obs=obs)
             cv2.imshow(args.window, make_visual(surround, bev))
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):

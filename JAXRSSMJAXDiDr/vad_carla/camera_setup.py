@@ -227,6 +227,9 @@ def build_vad_observation_overlay(
             enabled.append(key)
     if "collision" not in enabled:
         enabled.append("collision")
+    if normalize_camera_profile(camera_profile) == "b2d":
+        if "bev" not in enabled:
+            enabled.append("bev")
     if include_birdeye:
         if "birdeye_wpt" not in enabled:
             enabled.append("birdeye_wpt")
@@ -249,6 +252,21 @@ def build_vad_observation_overlay(
         overlay[f"{prefix}.attributes.image_size_y"] = int(height)
         overlay[f"{prefix}.attributes.fov"] = float(spec.fov if spec.fov is not None else fov)
         overlay[f"{prefix}.attributes.sensor_tick"] = float(sensor_tick)
+    if normalize_camera_profile(camera_profile) == "b2d":
+        overlay["env.observation.bev.handler"] = "camera"
+        overlay["env.observation.bev.blueprint"] = "sensor.camera.rgb"
+        overlay["env.observation.bev.key"] = "bev"
+        overlay["env.observation.bev.shape"] = [512, 512, 3]
+        overlay["env.observation.bev.transform.x"] = 0.0
+        overlay["env.observation.bev.transform.y"] = 0.0
+        overlay["env.observation.bev.transform.z"] = 50.0
+        overlay["env.observation.bev.transform.pitch"] = -90.0
+        overlay["env.observation.bev.transform.yaw"] = 0.0
+        overlay["env.observation.bev.transform.roll"] = 0.0
+        overlay["env.observation.bev.attributes.image_size_x"] = 512
+        overlay["env.observation.bev.attributes.image_size_y"] = 512
+        overlay["env.observation.bev.attributes.fov"] = 50.0
+        overlay["env.observation.bev.attributes.sensor_tick"] = float(sensor_tick)
     return overlay
 
 
