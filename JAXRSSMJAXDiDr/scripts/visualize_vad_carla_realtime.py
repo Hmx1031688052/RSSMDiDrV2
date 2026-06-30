@@ -36,6 +36,16 @@ from JAXRSSMJAXDiDr.vad_carla.camera_setup import (
     lidar2img_matrices,
 )
 
+B2D_MAP_CLASSES = ("Broken", "Solid", "SolidSolid", "Center", "TrafficLight", "StopSign")
+B2D_MAP_COLORS = {
+    0: (80, 170, 80),
+    1: (40, 130, 40),
+    2: (20, 95, 170),
+    3: (180, 130, 40),
+    4: (40, 40, 220),
+    5: (30, 120, 230),
+}
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -71,6 +81,18 @@ def parse_args(argv=None):
     parser.add_argument("--no_pretrained_norm", dest="pretrained_norm", action="store_false")
     parser.add_argument("--score_thresh", type=float, default=0.35)
     parser.add_argument("--map_score_thresh", type=float, default=0.35)
+    parser.add_argument(
+        "--map_label_filter",
+        default="all",
+        help="B2D map labels to draw: all, lanes, triggers, or comma-separated label names/ids.",
+    )
+    parser.add_argument(
+        "--map_max_per_class",
+        type=int,
+        default=12,
+        help="Maximum B2D local-map predictions drawn per map class.",
+    )
+    parser.add_argument("--map_draw_labels", action="store_true")
     parser.add_argument("--bev_size", type=int, default=640)
     parser.add_argument("--front_width", type=int, default=640)
     parser.add_argument("--surround_width", type=int, default=960)
@@ -88,6 +110,12 @@ def parse_args(argv=None):
         choices=range(6),
         metavar="[0-5]",
         help="Dummy B2D command one-hot index used only to satisfy VAD's planning branch during perception visualization.",
+    )
+    parser.add_argument(
+        "--b2d_agent_jpeg_quality",
+        type=int,
+        default=20,
+        help="JPEG quality used to mimic the original B2D VAD agent camera preprocessing; set <=0 to disable.",
     )
     parser.add_argument("--vad_debug", action="store_true")
     parser.add_argument("--vad_debug_every", type=int, default=50)
@@ -307,11 +335,20 @@ def make_absolute_can_bus(pose: dict) -> np.ndarray:
 def make_b2d_detector_results(images, pose, args, cfg, box_type_3d, step: int) -> dict:
     camera_order = get_camera_order(args.camera_profile)
     loader_expects_bgr = bool(cfg.img_norm_cfg.get("to_rgb", False))
+    jpeg_quality = int(getattr(args, "b2d_agent_jpeg_quality", 20))
     imgs = []
     for image in images:
         arr = np.asarray(image, dtype=np.float32)
         if loader_expects_bgr:
             arr = arr[..., ::-1]
+        if jpeg_quality > 0:
+            import cv2
+
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
+            ok, encoded = cv2.imencode(".jpg", np.clip(arr, 0, 255).astype(np.uint8), encode_param)
+            if not ok:
+                raise RuntimeError("B2D agent-style JPEG encoding failed for a camera frame.")
+            arr = cv2.imdecode(encoded, cv2.IMREAD_COLOR).astype(np.float32)
         imgs.append(arr)
     lidar2img = np.stack(
         lidar2img_matrices(
@@ -409,6 +446,12 @@ def run_b2d_detector_frame(
 ):
     if args.no_temporal_bev:
         reset_vad_temporal_state(model)
+    prev_info = getattr(model, "prev_frame_info", {})
+    used_prev_bev = (
+        not bool(args.no_temporal_bev)
+        and isinstance(prev_info, dict)
+        and prev_info.get("prev_bev") is not None
+    )
     results = make_b2d_detector_results(images, pose, args, cfg, box_type_3d, step)
     results = pipeline(results)
     meta = extract_b2d_pipeline_meta(results)
@@ -417,6 +460,7 @@ def run_b2d_detector_frame(
     with torch.no_grad():
         output_data_batch = model(input_data_batch, return_loss=False, rescale=True)
     result = decode_detector_output(output_data_batch, model)
+    result["used_prev_bev"] = used_prev_bev
     return result.get("bev_embed"), result, meta
 
 
@@ -506,6 +550,68 @@ def draw_agent_trajs(canvas, center, trajs, pc_range, color):
         draw_polyline(canvas, pts, pc_range, color, thickness=1)
 
 
+def map_classes_for_cfg(cfg) -> tuple[str, ...]:
+    classes = getattr(cfg, "map_classes", None)
+    if classes is None:
+        return B2D_MAP_CLASSES
+    return tuple(str(name) for name in classes)
+
+
+def parse_map_label_filter(args, cfg):
+    text = str(getattr(args, "map_label_filter", "all") or "all").strip()
+    if text.lower() in ("", "all", "*"):
+        return None
+    classes = map_classes_for_cfg(cfg)
+    lower_to_idx = {name.lower(): idx for idx, name in enumerate(classes)}
+    if text.lower() == "lanes":
+        return {idx for idx, name in enumerate(classes) if name in ("Broken", "Solid", "SolidSolid", "Center")}
+    if text.lower() == "triggers":
+        return {idx for idx, name in enumerate(classes) if name in ("TrafficLight", "StopSign")}
+
+    allowed = set()
+    for part in text.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if item.isdigit():
+            allowed.add(int(item))
+            continue
+        key = item.lower()
+        if key not in lower_to_idx:
+            raise ValueError(f"Unknown B2D map label {item!r}; classes={classes}")
+        allowed.add(lower_to_idx[key])
+    return allowed
+
+
+def draw_map_prediction(canvas, pts, label: int, score: float, pc_range, cfg, args):
+    import cv2
+
+    classes = map_classes_for_cfg(cfg)
+    color = B2D_MAP_COLORS.get(int(label), (80, 170, 80))
+    name = classes[int(label)] if 0 <= int(label) < len(classes) else str(label)
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] < 2:
+        return
+
+    is_trigger = name in ("TrafficLight", "StopSign")
+    draw_polyline(canvas, pts, pc_range, color, thickness=2 if is_trigger else 1, closed=is_trigger)
+    if is_trigger:
+        center = pts.mean(axis=0)
+        cv2.circle(canvas, point_to_bev(center, pc_range, canvas.shape[0]), 3, color, -1, cv2.LINE_AA)
+    if args.map_draw_labels:
+        anchor = point_to_bev(pts[0], pc_range, canvas.shape[0])
+        cv2.putText(
+            canvas,
+            f"{name}:{score:.2f}",
+            (anchor[0] + 3, anchor[1] + 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.32,
+            (30, 30, 30),
+            1,
+            cv2.LINE_AA,
+        )
+
+
 def render_bev(result, cfg, args):
     import cv2
 
@@ -525,10 +631,23 @@ def render_bev(result, cfg, args):
     if result is not None:
         map_pts = to_numpy(result["map_pts"])
         map_scores = to_numpy(result["map_scores"])
+        map_labels = to_numpy(result["map_labels"])
         if map_pts is not None and map_scores is not None:
-            for pts, score in zip(map_pts, map_scores):
-                if float(score) >= args.map_score_thresh:
-                    draw_polyline(canvas, pts, pc_range, (80, 170, 80), thickness=1)
+            allowed_labels = parse_map_label_filter(args, cfg)
+            labels_arr = np.zeros((len(map_scores),), dtype=np.int64) if map_labels is None else np.asarray(map_labels).reshape(-1)
+            order = np.argsort(np.asarray(map_scores, dtype=np.float32).reshape(-1))[::-1]
+            per_class_count = {}
+            for idx in order:
+                score = float(np.asarray(map_scores).reshape(-1)[idx])
+                label = int(labels_arr[idx]) if idx < len(labels_arr) else -1
+                if score < args.map_score_thresh:
+                    continue
+                if allowed_labels is not None and label not in allowed_labels:
+                    continue
+                per_class_count[label] = per_class_count.get(label, 0) + 1
+                if per_class_count[label] > int(args.map_max_per_class):
+                    continue
+                draw_map_prediction(canvas, map_pts[idx], label, score, pc_range, cfg, args)
 
         boxes = to_numpy(result["boxes"])
         scores = to_numpy(result["scores"])
@@ -606,6 +725,27 @@ def projection_coverage_summary(meta, cfg, args):
     return " ".join(items)
 
 
+def map_label_histogram(result, cfg, args) -> str:
+    if result is None:
+        return "none"
+    scores = to_numpy(result.get("map_scores"))
+    labels = to_numpy(result.get("map_labels"))
+    if scores is None or labels is None:
+        return "none"
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    classes = map_classes_for_cfg(cfg)
+    parts = []
+    for label in sorted(set(labels.tolist())):
+        mask = labels == int(label)
+        valid = mask & (scores >= float(args.map_score_thresh))
+        if not np.any(valid):
+            continue
+        name = classes[label] if 0 <= label < len(classes) else str(label)
+        parts.append(f"{name}:{int(valid.sum())}")
+    return ",".join(parts) if parts else "none"
+
+
 def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose):
     if not args.vad_debug:
         return
@@ -632,7 +772,10 @@ def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose)
         top_det_scores = np.sort(np.asarray(scores, dtype=np.float32).reshape(-1))[-5:][::-1].round(3).tolist()
     if map_scores is not None and len(map_scores):
         top_map_scores = np.sort(np.asarray(map_scores, dtype=np.float32).reshape(-1))[-5:][::-1].round(3).tolist()
-    prev_flag = prev_pose is not None and not args.no_temporal_bev
+    if result is not None and "used_prev_bev" in result:
+        prev_flag = bool(result["used_prev_bev"])
+    else:
+        prev_flag = prev_pose is not None and not args.no_temporal_bev
     print(
         "[VAD Debug] "
         f"step={step} model={args.vad_model} prev_bev={prev_flag} "
@@ -657,6 +800,7 @@ def print_vad_debug(step, obs, img_np, meta, result, cfg, args, pose, prev_pose)
         f"projection_grid={projection_coverage_summary(meta, cfg, args)} "
         f"dets={det_count}/{total_boxes}@{args.score_thresh:.2f} "
         f"maps={map_count}/{total_maps}@{args.map_score_thresh:.2f} "
+        f"map_hist={map_label_histogram(result, cfg, args)} "
         f"top_det={top_det_scores} top_map={top_map_scores}",
         flush=True,
     )
